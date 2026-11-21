@@ -41,9 +41,10 @@
   </div>
 </div>
 
-<!-- ไลบรารีจาก CDN (ล็อกเวอร์ชันไว้) -->
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@5.0.0-release.1/dist/opencv.js"></script>
+<!-- ไลบรารีเก็บไว้ใน repo เอง (ไม่โหลดโค้ดจากเว็บอื่น) -->
+<!-- onnxruntime-web 1.31.1, @techstark/opencv-js 5.0.0-release.1 -->
+<script src="vendor/ort.wasm.min.js"></script>
+<script src="vendor/opencv.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

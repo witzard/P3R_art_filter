@@ -3,7 +3,9 @@
 // - ฟิลเตอร์: OpenCV.js (พอร์ตจาก python/p3r_filter.py)
 
 const MODEL_URL = 'models/silueta.onnx';
-const ORT_WASM = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/';
+const ORT_WASM = new URL('vendor/', location.href).href;
+const MAX_FILE_MB = 30;          // กันไฟล์ใหญ่ผิดปกติ
+const MAX_PIXELS = 50e6;         // กันภาพที่ขยายแล้วกินแรมมหาศาล (decompression bomb)
 const MAX_SIZE = 1400; // ย่อภาพด้านยาวสุดเหลือเท่านี้ ให้ปรับ slider ได้ลื่น
 
 // [key, label, min, max, step, default]
@@ -33,10 +35,15 @@ function buildSliders() {
   for (const [key, label, min, max, step, def] of PARAMS) {
     const row = document.createElement('div');
     row.className = 'row';
-    row.innerHTML = `<label><span>${label}</span><span id="v_${key}">${def}</span></label>
-      <input type="range" id="p_${key}" min="${min}" max="${max}" step="${step}" value="${def}">`;
+    const lab = document.createElement('label');
+    const name = document.createElement('span'); name.textContent = label;
+    const val = document.createElement('span'); val.id = 'v_' + key; val.textContent = def;
+    lab.append(name, val);
+    const input = document.createElement('input');
+    Object.assign(input, { type: 'range', id: 'p_' + key, min, max, step, value: def });
+    row.append(lab, input);
     box.appendChild(row);
-    row.querySelector('input').addEventListener('input', (e) => {
+    input.addEventListener('input', (e) => {
       $('v_' + key).textContent = e.target.value;
       schedule();
     });
@@ -173,13 +180,17 @@ function refineEdges(rgb, mask, w, h, bandPx = 30) {
 
 // ------------------------------------------------------------ เตรียมข้อมูลตอนอัปโหลด
 async function prepare(file) {
+  if (!file.type.startsWith('image/')) throw new Error('ไฟล์นี้ไม่ใช่รูปภาพ');
+  if (file.size > MAX_FILE_MB * 1024 * 1024) throw new Error(`ไฟล์ใหญ่เกิน ${MAX_FILE_MB} MB`);
   const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  if (bmp.width * bmp.height > MAX_PIXELS) { bmp.close(); throw new Error('ภาพความละเอียดสูงเกินไป'); }
   const s = Math.min(1, MAX_SIZE / Math.max(bmp.width, bmp.height));
   const w = Math.round(bmp.width * s), h = Math.round(bmp.height * s);
   const c = document.createElement('canvas');
   c.width = w; c.height = h;
   const ctx = c.getContext('2d', { willReadFrequently: true });
   ctx.drawImage(bmp, 0, 0, w, h);
+  bmp.close();
   const rgba = ctx.getImageData(0, 0, w, h);
 
   const srcRGBA = cv.matFromImageData(rgba);
@@ -411,7 +422,8 @@ async function init() {
     if (!f) return;
     try {
       setStatus('กำลังเตรียมภาพ...');
-      if (state) { state.rgb.delete(); state.band.delete(); }
+      if (state) { state.rgb.delete(); state.band.delete(); state = null; }
+      $('download').disabled = true;
       state = await prepare(f);
       render();
       $('download').disabled = false;
