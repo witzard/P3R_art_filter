@@ -20,6 +20,8 @@ const PARAMS = [
   ['white',     'จุดขาวสุด (กันขาวโพลน)',     180, 255, 1,    238],
   ['gamma',     'แกมมา (>1 มืดลง)',          0.5, 2,   0.05, 1.0],
   ['shards',    'จำนวนเศษกระจก',             0,   80,  1,    25],
+  ['band',      'ลบพื้นหลังเดิมที่ขอบ (px)',    0,   60,  1,    30],
+  ['protect',   'ปกป้องจมูก/ส่วนหนา (px)',     0,   20,  1,    7],
 ];
 
 const $ = (id) => document.getElementById(id);
@@ -148,34 +150,119 @@ async function segment(canvas, w, h) {
   return mask;
 }
 
-// ลบพื้นหลังเดิมที่ติดอยู่ตามช่องผม/ขอบตัว (เช็คเฉพาะแถบขอบ)
-function refineEdges(rgb, mask, w, h, bandPx = 30) {
+// ข้อมูลสำหรับ refine ที่ไม่ขึ้นกับ slider: ระยะสีจากผนังเดิม, ความมืด, ระยะจากขอบ
+function edgeData(rgb, raw, w, h) {
   const lab = new cv.Mat();
   cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab);
-  const L = lab.data;
+  const L = lab.data, N = w * h;
   const hist = [new Array(256).fill(0), new Array(256).fill(0), new Array(256).fill(0)];
   let n = 0;
-  for (let i = 0; i < w * h; i++) {
-    if (mask[i] < 0.05) { hist[0][L[i*3]]++; hist[1][L[i*3+1]]++; hist[2][L[i*3+2]]++; n++; }
-  }
-  if (n < 300) { lab.delete(); return mask; }
+  for (let i = 0; i < N; i++)
+    if (raw[i] < 0.05) { hist[0][L[i*3]]++; hist[1][L[i*3+1]]++; hist[2][L[i*3+2]]++; n++; }
+  if (n < 300) { lab.delete(); return null; }
   const ref = [0, 1, 2].map((c) => percentileFromHist(hist[c], n, 0.5));
-
+  const wallDist = new Float32Array(N), dark = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    const dl = L[i*3] - ref[0], da = L[i*3+1] - ref[1], db = L[i*3+2] - ref[2];
+    wallDist[i] = Math.sqrt(dl*dl + da*da + db*db);
+    dark[i] = L[i*3] < ref[0] * 0.55 ? 1 : 0;
+  }
+  lab.delete();
   const inside = new cv.Mat(h, w, cv.CV_8U);
-  for (let i = 0; i < w * h; i++) inside.data[i] = mask[i] >= 0.5 ? 1 : 0;
+  for (let i = 0; i < N; i++) inside.data[i] = raw[i] >= 0.5 ? 1 : 0;
   const dist = new cv.Mat();
   cv.distanceTransform(inside, dist, cv.DIST_L2, 5);
-  const D = dist.data32F;
+  const edgeDist = dist.data32F.slice();
+  inside.delete(); dist.delete();
+  return { wallDist, dark, edgeDist };
+}
 
-  const out = new Float32Array(w * h);
-  for (let i = 0; i < w * h; i++) {
-    const dl = L[i*3] - ref[0], da = L[i*3+1] - ref[1], db = L[i*3+2] - ref[2];
-    const key = Math.min(1, Math.max(0, (Math.sqrt(dl*dl + da*da + db*db) - 10) / 18));
-    const near = Math.min(1, Math.max(0, 1 - D[i] / bandPx));
-    out[i] = mask[i] * (1 - near * (1 - key));
+// ลบพื้นหลังเดิมที่ติดอยู่ตามช่องผม/ขอบตัว (เช็คเฉพาะแถบขอบ)
+// - ลบเฉพาะส่วน "บาง" ที่สีเหมือนผนัง (ช่องผม, halo)
+// - ส่วนหนา เช่น จมูก ริมฝีปาก ที่สีไม่ใช่ผนังแท้ จะไม่ถูกลบ
+// - จุดที่ไม่ต่อกับพื้นหลังและไม่ติดผม (เช่น ไฮไลต์บนจมูก) จะไม่ถูกลบ
+function refineEdges(raw, ed, w, h, bandPx, protectPx) {
+  const N = w * h;
+  if (!ed || bandPx <= 0) return gaussF(raw, w, h, 1.0);
+  const { wallDist, dark, edgeDist } = ed;
+  const removed = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const key = Math.min(1, Math.max(0, (wallDist[i] - 10) / 18));
+    const near = Math.min(1, Math.max(0, 1 - edgeDist[i] / bandPx));
+    removed[i] = near * (1 - key);
   }
-  lab.delete(); inside.delete(); dist.delete();
+  const region = new cv.Mat(h, w, cv.CV_8U);
+  const setRegion = () => { for (let i = 0; i < N; i++) region.data[i] = removed[i] > 0.3 && raw[i] > 0.5 ? 1 : 0; };
+
+  if (protectPx > 0) {
+    setRegion();
+    const k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(2 * protectPx + 1, 2 * protectPx + 1));
+    const thick = new cv.Mat();
+    cv.morphologyEx(region, thick, cv.MORPH_OPEN, k);
+    const k3 = cv.Mat.ones(3, 3, cv.CV_8U);
+    cv.dilate(thick, thick, k3);
+    const tf = gaussF(Float32Array.from(thick.data), w, h, 1.5);
+    for (let i = 0; i < N; i++) {
+      const notWall = Math.min(1, Math.max(0, (wallDist[i] - 8) / 8));
+      removed[i] *= 1 - Math.min(1, tf[i] * 1.5) * notWall;
+    }
+    k.delete(); thick.delete(); k3.delete();
+  }
+
+  // ลบได้เฉพาะกลุ่มที่ต่อกับพื้นหลังจริง หรืออยู่ติดผม/ส่วนมืด
+  setRegion();
+  const labels = new cv.Mat();
+  const nLab = cv.connectedComponents(region, labels, 8, cv.CV_32S);
+  if (nLab > 1) {
+    const seedOut = new cv.Mat(h, w, cv.CV_8U), seedDark = new cv.Mat(h, w, cv.CV_8U);
+    for (let i = 0; i < N; i++) { seedOut.data[i] = raw[i] < 0.5 ? 1 : 0; seedDark.data[i] = dark[i]; }
+    const k5 = cv.Mat.ones(5, 5, cv.CV_8U), k7 = cv.Mat.ones(7, 7, cv.CV_8U);
+    cv.dilate(seedOut, seedOut, k5);
+    cv.dilate(seedDark, seedDark, k7);
+    const ok = new Uint8Array(nLab); ok[0] = 1;
+    const lb = labels.data32S;
+    for (let i = 0; i < N; i++) if (region.data[i] && (seedOut.data[i] || seedDark.data[i])) ok[lb[i]] = 1;
+    const bad = new cv.Mat(h, w, cv.CV_8U);
+    for (let i = 0; i < N; i++) bad.data[i] = ok[lb[i]] ? 0 : 1;
+    const k3 = cv.Mat.ones(3, 3, cv.CV_8U);
+    cv.dilate(bad, bad, k3);
+    const bf = gaussF(Float32Array.from(bad.data), w, h, 1.0);
+    for (let i = 0; i < N; i++) removed[i] *= 1 - Math.min(1, bf[i]);
+    seedOut.delete(); seedDark.delete(); k5.delete(); k7.delete(); bad.delete(); k3.delete();
+  }
+  labels.delete(); region.delete();
+
+  const out = new Float32Array(N);
+  for (let i = 0; i < N; i++) out[i] = raw[i] * (1 - removed[i]);
   return gaussF(out, w, h, 1.0);
+}
+
+// สร้าง mask สุดท้าย + แถบขอบสำหรับ inpaint (คำนวณใหม่เมื่อ slider ขอบเปลี่ยน)
+function buildMask(st, bandPx, protectPx) {
+  const key = `${bandPx}|${protectPx}`;
+  if (st.maskKey === key) return;
+  const { w, h } = st, N = w * h;
+  const mask = refineEdges(st.raw, st.edge, w, h, bandPx, protectPx);
+
+  const band = new cv.Mat(h, w, cv.CV_8U);
+  const inner = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    band.data[i] = mask[i] > 0.02 && mask[i] <= 0.95 ? 255 : 0;
+    inner[i] = mask[i] > 0.95 ? 1 : 0;
+  }
+  const k5 = cv.Mat.ones(5, 5, cv.CV_8U);
+  cv.dilate(band, band, k5);
+  for (let i = 0; i < N; i++) if (inner[i]) band.data[i] = 0;
+
+  // mask สำหรับรวมภาพ: หดเข้านิด + ขอบนุ่ม
+  const mm = newF32(w, h, mask), me = new cv.Mat();
+  cv.erode(mm, me, k5);
+  cv.GaussianBlur(me, me, new cv.Size(0, 0), 1.0, 1.0);
+  const maskE = me.data32F.slice();
+  mm.delete(); me.delete(); k5.delete();
+
+  if (st.band) st.band.delete();
+  Object.assign(st, { mask, maskE, band, maskKey: key });
 }
 
 // ------------------------------------------------------------ เตรียมข้อมูลตอนอัปโหลด
@@ -200,27 +287,8 @@ async function prepare(file) {
 
   setStatus('กำลังตัดพื้นหลัง...');
   await new Promise((r) => setTimeout(r, 20));
-  let mask = await segment(c, w, h);
-  mask = refineEdges(rgb, mask, w, h);
-
-  // แถบขอบสำหรับ inpaint (กันขอบขาว)
-  const band = new cv.Mat(h, w, cv.CV_8U);
-  const inner = new cv.Mat(h, w, cv.CV_8U);
-  for (let i = 0; i < w * h; i++) {
-    band.data[i] = mask[i] > 0.02 && mask[i] <= 0.95 ? 255 : 0;
-    inner.data[i] = mask[i] > 0.95 ? 255 : 0;
-  }
-  const k5 = cv.Mat.ones(5, 5, cv.CV_8U);
-  cv.dilate(band, band, k5);
-  for (let i = 0; i < w * h; i++) if (inner.data[i]) band.data[i] = 0;
-  inner.delete();
-
-  // mask สุดท้ายสำหรับรวมภาพ: หดเข้านิด + ขอบนุ่ม
-  const mm = newF32(w, h, mask), me = new cv.Mat();
-  cv.erode(mm, me, k5);
-  cv.GaussianBlur(me, me, new cv.Size(0, 0), 1.0, 1.0);
-  const maskE = me.data32F.slice();
-  mm.delete(); me.delete(); k5.delete();
+  const raw = await segment(c, w, h);
+  const edge = edgeData(rgb, raw, w, h);
 
   // ค่าที่ไม่ขึ้นกับ slider: blur ของภาพสี และ high-pass ของ gray ต้นฉบับ
   const rgbF = new cv.Mat(); rgb.convertTo(rgbF, cv.CV_32FC3);
@@ -238,7 +306,7 @@ async function prepare(file) {
   cv.bilateralFilter(b1, b2, 7, 30, 7);
 
   const st = {
-    w, h, rgba, rgb, mask, maskE, band, hp,
+    w, h, rgba, rgb, raw, edge, hp, band: null, maskKey: null,
     rgbF: rgbF.data32F.slice(), rgbBlur: rgbBlur.data32F.slice(), smooth: b2.data.slice(),
     bgCache: null,
   };
@@ -295,6 +363,7 @@ function render() {
   const p = getParams();
   const { w, h } = state;
   const N = w * h;
+  buildMask(state, p.band, p.protect);
 
   if ($('showOrig').checked) {
     const out = $('out'); out.width = w; out.height = h;
@@ -422,7 +491,7 @@ async function init() {
     if (!f) return;
     try {
       setStatus('กำลังเตรียมภาพ...');
-      if (state) { state.rgb.delete(); state.band.delete(); state = null; }
+      if (state) { state.rgb.delete(); if (state.band) state.band.delete(); state = null; }
       $('download').disabled = true;
       state = await prepare(f);
       render();

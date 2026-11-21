@@ -19,7 +19,7 @@ import numpy as np
 
 
 # ---------------------------------------------------------------- 1. ตัดพื้นหลัง
-def get_mask(img_bgr):
+def get_mask(img_bgr, band=30, protect=None):
     """คืน mask 0..1 (float32) ของตัวคน"""
     try:
         from rembg import remove, new_session
@@ -34,17 +34,25 @@ def get_mask(img_bgr):
         rect = (int(w * .05), int(h * .02), int(w * .9), int(h * .97))
         cv2.grabCut(img_bgr, m, rect, None, None, 5, cv2.GC_INIT_WITH_RECT)
         mask = np.where((m == 1) | (m == 3), 1.0, 0.0).astype(np.float32)
-    mask = refine_edges(img_bgr, mask)
+    mask = refine_edges(img_bgr, mask, band, protect)
     # ขอบนุ่มเล็กน้อย ไม่ให้ดูเหมือนตัดแปะ
     return cv2.GaussianBlur(mask, (0, 0), 1.0)
 
 
-def refine_edges(img_bgr, mask, band_px=30):
+def refine_edges(img_bgr, mask, band_px=30, protect_px=None):
     """
     ลบพื้นหลังเดิมที่ติดมาตามช่องว่างของผมหยิก/ขอบตัว:
     พิกเซลที่สีใกล้สีพื้นหลังเดิม และอยู่ใกล้ขอบ จะถูกลดค่า mask
     (เช็คเฉพาะแถบขอบ ไม่ไปกัดผิวด้านใน)
+
+    protect_px: ลบได้เฉพาะส่วนที่ "บาง" (ช่องผม, ขอบ halo)
+    ส่วนที่หนากว่า ~2*protect_px เช่น จมูก ริมฝีปาก แก้มที่โดนแสง
+    จะไม่ถูกลบ แม้สีจะใกล้ผนัง (0 = ปิดการป้องกัน)
     """
+    if band_px <= 0:
+        return mask
+    if protect_px is None:
+        protect_px = max(3, round(max(mask.shape) * 0.005))
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     bg_px = lab[mask < 0.05]
     if bg_px.size < 300:
@@ -57,7 +65,35 @@ def refine_edges(img_bgr, mask, band_px=30):
     outside = (mask < 0.5).astype(np.uint8)
     d = cv2.distanceTransform(1 - outside, cv2.DIST_L2, 5)
     near = np.clip(1 - d / band_px, 0, 1)
-    return mask * (1 - near * (1 - key))
+    removed = near * (1 - key)
+
+    if protect_px > 0:
+        # ส่วนที่จะถูกลบ ถ้าหนาพอที่ kernel วงกลมขนาดนี้ใส่ได้ = เนื้อจริง ไม่ใช่ช่องผม
+        region = ((removed > 0.3) & (mask > 0.5)).astype(np.uint8)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                      (2 * protect_px + 1, 2 * protect_px + 1))
+        thick = cv2.morphologyEx(region, cv2.MORPH_OPEN, k)
+        thick = cv2.dilate(thick, np.ones((3, 3), np.uint8)).astype(np.float32)
+        thick = cv2.GaussianBlur(thick, (0, 0), 1.5)
+        # ปกป้องเฉพาะส่วนหนาที่สี "ไม่ใช่ผนังแท้" (halo ผนังจริงสีห่างแค่ ~0-8)
+        not_wall = np.clip((dist - 8) / 8, 0, 1)
+        removed *= 1 - np.clip(thick * 1.5, 0, 1) * not_wall
+
+    # ลบได้เฉพาะกลุ่มพิกเซลที่ (ก) ต่อกับพื้นหลังจริง หรือ (ข) อยู่ติดผม/ส่วนมืด
+    # กันจุดไฮไลต์บนจมูก/หน้าผากที่สีสว่างใกล้ผนังไม่ให้กลายเป็นรู
+    region = ((removed > 0.3) & (mask > 0.5)).astype(np.uint8)
+    n, lbl = cv2.connectedComponents(region, connectivity=8)
+    if n > 1:
+        seed = cv2.dilate(outside, np.ones((5, 5), np.uint8))
+        dark = (lab[:, :, 0] < bg_ref[0] * 0.55).astype(np.uint8)
+        seed = seed | cv2.dilate(dark, np.ones((7, 7), np.uint8))
+        ok = np.zeros(n, bool)
+        ok[np.unique(lbl[(seed > 0) & (region > 0)])] = True
+        ok[0] = True
+        bad = (~ok[lbl]).astype(np.float32)
+        bad = cv2.GaussianBlur(cv2.dilate(bad, np.ones((3, 3), np.uint8)), (0, 0), 1.0)
+        removed *= 1 - np.clip(bad, 0, 1)
+    return mask * (1 - removed)
 
 
 # ---------------------------------------------------------------- 2. ลบริ้วรอยบางส่วน
@@ -170,8 +206,8 @@ def make_background(h, w, color="#12ACF4", shards=25, seed=7):
 # ---------------------------------------------------------------- 6. รวมทั้งหมด
 def p3r_filter(img_bgr, smooth=0.45, levels=6, posterize=0.55,
                ink=0.35, tint=0.12, bg_color="#12ACF4", shards=25,
-               black=22, white=238, gamma=1.0, detail=0.9):
-    mask = get_mask(img_bgr)
+               black=22, white=238, gamma=1.0, detail=0.9, band=30, protect=None):
+    mask = get_mask(img_bgr, band, protect)
     soft = soften_skin(img_bgr, smooth)
     gray = cv2.cvtColor(soft, cv2.COLOR_BGR2GRAY)
 
@@ -222,6 +258,8 @@ def main():
     p.add_argument("--detail", type=float, default=0.9, help="รายละเอียดผม/ผ้า 0-2")
     p.add_argument("--bg", default="#12ACF4", help="สีพื้นหลัง")
     p.add_argument("--shards", type=int, default=25, help="จำนวนเศษกระจก (0 = ปิด)")
+    p.add_argument("--band", type=int, default=30, help="ระยะลบพื้นหลังเดิมที่ขอบ px (0 = ปิด)")
+    p.add_argument("--protect", type=int, default=None, help="ปกป้องจมูก/ส่วนหนา px (0 = ปิด, ไม่ใส่ = อัตโนมัติ)")
     p.add_argument("--max-size", type=int, default=2000)
     a = p.parse_args()
 
@@ -233,7 +271,7 @@ def main():
         img = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
 
     out = p3r_filter(img, a.smooth, a.levels, a.posterize, a.ink, a.tint,
-                     a.bg, a.shards, a.black, a.white, a.gamma, a.detail)
+                     a.bg, a.shards, a.black, a.white, a.gamma, a.detail, a.band, a.protect)
     cv2.imwrite(a.output, out)
     print("saved:", a.output)
 
