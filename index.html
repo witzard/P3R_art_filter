@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P3R Art Filter</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; max-width: 1100px; }
+  .wrap { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
+  .panel { flex: 0 0 300px; }
+  .view { flex: 1 1 400px; min-width: 0; }
+  .row { margin-bottom: 10px; }
+  .row label { display: flex; justify-content: space-between; font-size: 14px; }
+  .row input[type=range] { width: 100%; }
+  canvas { max-width: 100%; height: auto; border: 1px solid #ccc; display: block; }
+  button { margin: 4px 4px 4px 0; padding: 6px 10px; }
+  #status { color: #555; font-size: 14px; margin: 8px 0; }
+</style>
+</head>
+<body>
+<h2>P3R Art Filter</h2>
+
+<div class="row">
+  <input type="file" id="file" accept="image/*" disabled>
+</div>
+<div id="status">กำลังโหลด OpenCV และโมเดลตัดพื้นหลัง...</div>
+
+<div class="wrap">
+  <div class="panel">
+    <div id="sliders"></div>
+    <div class="row">
+      <label>สีพื้นหลัง <input type="color" id="bg" value="#12acf4"></label>
+    </div>
+    <button id="reseed">สุ่มเศษกระจกใหม่</button>
+    <button id="reset">ค่าเริ่มต้น</button><br>
+    <label style="font-size:14px"><input type="checkbox" id="showOrig"> ดูภาพต้นฉบับ</label><br>
+    <button id="download" disabled>ดาวน์โหลด PNG</button>
+  </div>
+  <div class="view">
+    <canvas id="out" width="10" height="10"></canvas>
+  </div>
+</div>
+
+<!-- ไลบรารีจาก CDN (ล็อกเวอร์ชันไว้) -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@5.0.0-release.1/dist/opencv.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
