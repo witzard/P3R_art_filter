@@ -433,6 +433,88 @@ function u8Mat(w, h, src) {
 function ellipse(n) { return cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(n, n)); }
 function median8(m, k) { const d = new cv.Mat(); cv.medianBlur(m, d, k); m.delete(); return d; }
 
+// ------------------------------------------------------------ directional hair (structure tensor + streamline smoothing)
+// ค่าภายใน (ไม่แสดงใน UI)
+const HAIR_FLOW = {
+  coherenceSigma: 6,    // ขนาดบริเวณที่ใช้หาทิศเส้นผม (px @1400)
+  flowLength: 10,       // ความยาว streamline สูงสุด (px @1400) คูณด้วย hairCleanup
+  sensitivity: 2.0,     // ความไวต่อ coherence (สูง = ถือว่าทิศชัดง่ายขึ้น)
+  consolidation: 0.6,   // ลด wave component ในบริเวณที่ทิศไม่ชัด (กดไฮไลต์เล็ก ๆ ที่ไม่ใช่ทรงผม)
+  waveScale: 14,        // ขนาดลอนผม (px @1400): ไฮไลต์ = สันลอนที่สว่างกว่ารอบ ๆ
+  waveGain: 1.1,        // น้ำหนักของสันลอนเทียบกับแสงรวม (สูง = ไฮไลต์ตามลอนมากขึ้น ไม่เป็นแถบ)
+  broadWeight: 0.8,     // น้ำหนักของแสงรวม (low-frequency)
+};
+function hairFlowValues(st, v, region, hc) {
+  const { w, h, f } = st, N = w * h;
+  const vIso = gaussF(v, w, h, (1 + 1.5 * hc) * f);
+  const bb = bboxOf(region, w, h, 0, Math.round(8 * f));
+  if (!bb) return vIso;
+  const { x0, y0, rw, rh } = bb, M = rw * rh;
+  // 1-2) structure tensor -> ทิศเส้นผม + coherence (ไม่ขึ้นกับ slider: cache ต่อภาพ/กรอบ)
+  const key = `${x0},${y0},${rw},${rh}`;
+  if (!st.flowCache || st.flowCache.key !== key) {
+    const g = new cv.Mat(rh, rw, cv.CV_32F), GD = g.data32F;
+    for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) GD[y * rw + x] = st.g0[(y0 + y) * w + x0 + x];
+    cv.GaussianBlur(g, g, new cv.Size(0, 0), 1.2 * f, 1.2 * f);
+    const ix = new cv.Mat(), iy = new cv.Mat();
+    cv.Sobel(g, ix, cv.CV_32F, 1, 0); cv.Sobel(g, iy, cv.CV_32F, 0, 1);
+    const IX = ix.data32F, IY = iy.data32F;
+    const j11 = new Float32Array(M), j22 = new Float32Array(M), j12 = new Float32Array(M);
+    for (let i = 0; i < M; i++) { j11[i] = IX[i] * IX[i]; j22[i] = IY[i] * IY[i]; j12[i] = IX[i] * IY[i]; }
+    g.delete(); ix.delete(); iy.delete();
+    const sg = HAIR_FLOW.coherenceSigma * f;
+    const a = gaussF(j11, rw, rh, sg), b = gaussF(j22, rw, rh, sg), c = gaussF(j12, rw, rh, sg);
+    const dx = new Float32Array(M), dy = new Float32Array(M), coh = new Float32Array(M);
+    for (let i = 0; i < M; i++) {
+      const d = Math.sqrt((a[i] - b[i]) * (a[i] - b[i]) + 4 * c[i] * c[i]), tr = a[i] + b[i] + 1e-6;
+      coh[i] = clamp01(Math.pow(d / tr, 2) * HAIR_FLOW.sensitivity);
+      const phi = 0.5 * Math.atan2(2 * c[i], a[i] - b[i]);   // ทิศ gradient
+      dx[i] = -Math.sin(phi); dy[i] = Math.cos(phi);          // ทิศตามเส้นผม
+    }
+    st.flowCache = { key, dx, dy, coh };
+  }
+  const { dx, dy, coh } = st.flowCache;
+  // 3) เฉลี่ยตาม streamline (โค้งตามลอนผม) เฉพาะภายในบริเวณผม
+  const src = new Float32Array(M), inR = new Uint8Array(M);
+  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+    const i = (y0 + y) * w + x0 + x; src[y * rw + x] = vIso[i]; inR[y * rw + x] = region[i];
+  }
+  const Lmax = Math.max(1, Math.round(HAIR_FLOW.flowLength * hc * f));
+  const out = new Float32Array(M);
+  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+    const i0 = y * rw + x;
+    if (!inR[i0]) { out[i0] = src[i0]; continue; }
+    const L = Math.max(1, Math.round(Lmax * (0.3 + 0.7 * coh[i0])));
+    let sum = src[i0], n = 1;
+    for (const sgn of [1, -1]) {
+      let px = x, py = y, pdx = dx[i0] * sgn, pdy = dy[i0] * sgn;
+      for (let k = 0; k < L; k++) {
+        px += pdx; py += pdy;
+        const xi = Math.round(px), yi = Math.round(py);
+        if (xi < 0 || yi < 0 || xi >= rw || yi >= rh) break;
+        const j = yi * rw + xi;
+        if (!inR[j]) break;
+        sum += src[j]; n++;
+        let ndx = dx[j], ndy = dy[j];
+        if (ndx * pdx + ndy * pdy < 0) { ndx = -ndx; ndy = -ndy; }   // ทิศต่อเนื่อง ไม่กลับหัว
+        pdx = ndx; pdy = ndy;
+      }
+    }
+    out[i0] = sum / n;
+  }
+  // 4) ไฮไลต์ = แสงรวม (ลดน้ำหนัก) + สันลอนผม (band-pass ของภาพที่เฉลี่ยตามทิศแล้ว)
+  //    บริเวณที่ทิศไม่ชัด ลดส่วนสันลอนลง กันไฮไลต์เล็ก ๆ กระจาย
+  const broad = gaussF(src, rw, rh, 12 * f), wave = gaussF(out, rw, rh, HAIR_FLOW.waveScale * f);
+  const res = vIso.slice();
+  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+    const j = y * rw + x;
+    if (!inR[j]) continue;
+    const k = 1 - (1 - coh[j]) * HAIR_FLOW.consolidation;
+    res[(y0 + y) * w + x0 + x] = broad[j] * HAIR_FLOW.broadWeight + (out[j] - wave[j]) * HAIR_FLOW.waveGain * k + 0.2;
+  }
+  return res;
+}
+
 // ------------------------------------------------------------ ROI helpers (ประมวลผลเฉพาะกรอบที่จำเป็น)
 function bboxOf(arr, w, h, t, pad) {
   let x0 = w, y0 = h, x1 = -1, y1 = -1;
@@ -658,21 +740,52 @@ function renderPerson(st, p) {
     const wg = gaussF(Float32Array.from(region), w, h, 1.0 * f);
     for (let i = 0; i < N; i++) tone[i] = tone[i] * (1 - wg[i]) + tr[i] * wg[i];
   };
-  // เสื้อผ้า / ของ: ใช้ระดับเต็ม merge ปานกลาง
+  // Texture vs structure: ความหนาแน่นของขอบเล็ก ๆ (ลายปัก ตัวอักษร เนื้อผ้า) ในบริเวณเสื้อผ้า
+  const TEX = { densitySigma: 7, densityLow: 0.08, densityHigh: 0.2, simplifyKernel: 9 };
+  if (!st.densCache) {   // ไม่ขึ้นกับ slider: คำนวณครั้งเดียวต่อภาพ
+    const edS = u8Mat(w, h, st.g0), edM = new cv.Mat();   // ภาพต้นฉบับ: ยังมีลายปัก/ตัวอักษรให้วัด
+    cv.Canny(edS, edM, 40, 100);
+    const EDD = edM.data, edF = new Float32Array(N);
+    for (let i = 0; i < N; i++) edF[i] = EDD[i] / 255;
+    edS.delete(); edM.delete();
+    st.densCache = gaussF(edF, w, h, TEX.densitySigma * f);
+  }
+  const dens = st.densCache;
+  const texW = new Float32Array(N);
+  for (let i = 0; i < N; i++)
+    texW[i] = clothX[i] ? clamp01((dens[i] - TEX.densityLow) / (TEX.densityHigh - TEX.densityLow)) : 0;
+
+  // เสื้อผ้า / ของ: ใช้ระดับเต็ม; บริเวณ texture หนาแน่น (เช่น ตราสัญลักษณ์) ทำให้เรียบก่อน
+  // เหลือขอบใหญ่ สัญลักษณ์หลัก และก้อนโทนหลัก ลบตัวอักษร/ลายปักเล็ก ๆ
   const vc = gaussF(v, w, h, 1.5 * f);
+  const bbTex = bboxOf(texW, w, h, 0, Math.round(TEX.simplifyKernel * f));
+  if (bbTex) {
+    const v255 = new Float32Array(N);
+    for (let i = 0; i < N; i++) v255[i] = vc[i] * 255;
+    const vmed = median8(subU8(v255, w, bbTex), odd(TEX.simplifyKernel * f)), MD = vmed.data;
+    const { x0, y0, rw, rh } = bbTex;
+    for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+      const i = (y0 + y) * w + x0 + x, t = texW[i];
+      if (t > 0) vc[i] = vc[i] * (1 - t) + (MD[y * rw + x] / 255) * t;
+    }
+    vmed.delete();
+  }
+  // ขอบโทนของเสื้อผ้าเรียบน้อยกว่าผม/ผิว (เก็บมุม)
   let tone = toneRegion(st, vc, clothX, Array.from({ length: L - 1 }, (_, k) => (k + 1) / L), palOf(L),
-    (1 + 3 * merge) * f, (1 + 2 * merge) * f, sup * 0.0015 * N, (1 + 2 * merge) * f, hard);
+    (1 + 3 * merge) * f, (1 + 2 * merge) * f, sup * 0.0015 * N, (0.8 + 1.2 * merge) * f, hard);
   // ผม: เกณฑ์จากความสว่างของผมเอง, สว่างสุดแค่โทนกลาง-สว่าง, รวมก้อนใหญ่
   if (hasHair) {
-    const vh = gaussF(v, w, h, (2 + 4 * hc) * f);
-    const nl = hc > 0.3 ? Math.min(3, L) : Math.min(L, 4);
-    const qs = nl === 2 ? [0.6] : nl === 3 ? [0.55, 0.9] : [0.4, 0.7, 0.92];
-    const th = qs.map((q) => percentileOf(vh, hairH, q));
     // ขอบนอกของผม (mask มีแต่ความน่าจะเป็นผม < 0.5) ใช้ palette ของผมด้วย กันขอบสว่างแปลก ๆ
     const hairX = morphU8(hairH, w, h, 'dilate', odd(12 * f));
     for (let i = 0; i < N; i++) hairX[i] = hairX[i] && !faceH[i] && R.cloth[i] < 0.3 && mask[i] > 0.02 ? 1 : 0;
+    // ไฮไลต์ตามทิศเส้นผม แทนการ blur รอบทิศ (กันแถบแนวนอน/ลายพราง)
+    const vh = hairFlowValues(st, v, hairX, hc);
+    const nl = hc > 0.3 ? Math.min(3, L) : Math.min(L, 4);
+    const qs = nl === 2 ? [0.6] : nl === 3 ? [0.5, 0.86] : [0.4, 0.68, 0.9];
+    const th = qs.map((q) => percentileOf(vh, hairH, q));
+    // merge แบบรอบทิศเล็กลง: การรวมหลักทำตามทิศเส้นผมแล้ว
     over(toneRegion(st, vh, morphU8(hairX, w, h, 'dilate', k4), th, palOf(nl, 0, 0.62),
-      (2 + 8 * hc) * f, (2 + 6 * hc) * f, (0.0015 + 0.006 * hc) * sup * N, (2 + 4 * hc) * f, hard), hairX);
+      (1 + 3 * hc) * f, (1.5 + 3 * hc) * f, (0.0015 + 0.005 * hc) * sup * N, (1.5 + 2 * hc) * f, hard), hairX);
   }
   // หน้า: normalize ความสว่างผิว, ไม่เกิน 3 ระดับ, เงาไม่ต่ำกว่าเทากลาง, ลบเงาเล็ก ๆ บนแก้ม
   if (hasSkin) {
@@ -716,7 +829,7 @@ function renderPerson(st, p) {
 
   // 6. คืนรายละเอียดเฉพาะบริเวณ: ผ้าเล็กน้อย, ผมเฉพาะโครงหยาบ, ผิวไม่คืน
   for (let i = 0; i < N; i++)
-    tone[i] += p.detail * (st.hp[i] * clothH[i] * 0.15 + st.hpc[i] * hair[i] * p.hairDetail * 0.35);
+    tone[i] += p.detail * (st.hp[i] * clothH[i] * 0.15 * (1 - texW[i]) + st.hpc[i] * hair[i] * p.hairDetail * 0.35);
 
   // 7. เส้นตามลำดับความสำคัญ: silhouette > ตา/ปาก/คิ้ว/แว่น > ขอบก้อนผม > รอยพับผ้า > ผิว (ไม่มี)
   const aa = (arr, sg = 0.6) => gaussF(arr instanceof Float32Array ? arr : Float32Array.from(arr), w, h, sg * f);
@@ -762,12 +875,14 @@ function renderPerson(st, p) {
   // กรอบแว่น / เปลือกตา / ส่วนที่ parsing หาไม่เจอ: เส้นบางมืดด้วย black-hat
   if (fp > 0 && hasSkin) {
     // ถ้าเจอตา ใช้เฉพาะรอบตา/คิ้ว (แว่น เปลือกตา) กันรอยย่นบนแก้ม; ไม่เจอ (หน้าด้านข้าง) ใช้ทั้งหน้า
-    let zone;
+    // zone = ทั้งหน้า; eyeZone = รอบตา/คิ้ว (ถ้าเจอตา). นอก eyeZone รับเฉพาะเส้นบาง ยาว ตรง (ก้านแว่น)
+    const zone = morphU8(faceH, w, h, 'dilate', odd(41 * f));
+    let eyeZone = null;
     if (st.hasRegions && mx(R.eye) > 0.3) {
       const eb = new Uint8Array(N);
       for (let i = 0; i < N; i++) eb[i] = R.eye[i] + R.brow[i] > 0.3 ? 1 : 0;
-      zone = morphU8(eb, w, h, 'dilate', odd(31 * f));
-    } else zone = morphU8(faceH, w, h, 'dilate', odd(41 * f));
+      eyeZone = morphU8(eb, w, h, 'dilate', odd(31 * f));
+    }
     const bb = bboxOf(zone, w, h, 0, Math.round(8 * f));
     if (bb) {
       const { x0, y0, rw, rh } = bb, M = rw * rh;
@@ -775,15 +890,42 @@ function renderPerson(st, p) {
       cv.GaussianBlur(g1, g1, new cv.Size(0, 0), 0.8 * f, 0.8 * f);
       cv.morphologyEx(g1, bh, cv.MORPH_BLACKHAT, kb);
       const BH = bh.data, fl = new cv.Mat(rh, rw, cv.CV_8U), FL = fl.data;
+      // บนผมยอมรับเฉพาะเส้นที่ตัดกันชัดกว่า (กรอบแว่นพาดผม) กันเส้นผมทั่วไป
       for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
         const i = (y0 + y) * w + x0 + x, j = y * rw + x;
-        FL[j] = BH[j] > 16 && zone[i] && mbA[i] && hair[i] < 0.6 && mouth[i] < 0.3 ? 1 : 0;
+        FL[j] = BH[j] > 16 && zone[i] && mbA[i] && mouth[i] < 0.3 && (hair[i] < 0.6 || BH[j] > 22) ? 1 : 0;
       }
       const labels = new cv.Mat(), stats = new cv.Mat(), cents = new cv.Mat();
       const nc = cv.connectedComponentsWithStats(fl, labels, stats, cents, 8, cv.CV_32S);
-      const A = stats.data32S, keep = new Uint8Array(nc);
-      for (let c = 1; c < nc; c++) keep[c] = Math.max(A[c * 5 + 2], A[c * 5 + 3]) >= 12 * f && A[c * 5 + 4] >= 10 * f * f ? 1 : 0;
-      const L32 = labels.data32S, flf = new Float32Array(M);
+      const A = stats.data32S, L32 = labels.data32S;
+      const sumBH = new Float32Array(nc), sumHair = new Float32Array(nc), sumEye = new Float32Array(nc);
+      const mX = new Float64Array(nc), mY = new Float64Array(nc), mXX = new Float64Array(nc), mYY = new Float64Array(nc), mXY = new Float64Array(nc);
+      for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+        const j = y * rw + x, c = L32[j];
+        if (!c) continue;
+        const i = (y0 + y) * w + x0 + x;
+        sumBH[c] += BH[j]; sumHair[c] += hair[i]; sumEye[c] += eyeZone ? eyeZone[i] : 1;
+        mX[c] += x; mY[c] += y; mXX[c] += x * x; mYY[c] += y * y; mXY[c] += x * y;
+      }
+      // จำแนกด้วย ยาว + หนา + contrast (ไม่ใช่ความยาวอย่างเดียว):
+      //  - บนผิว: ยาวพอ หรือสั้นแต่ contrast สูงมาก (ขอบตา, จุดยึดแว่น)
+      //  - บนผม: ต้องบางและยาว (ก้านแว่น) ไม่งั้นถือเป็นเส้นผม
+      const keep = new Uint8Array(nc);
+      for (let c = 1; c < nc; c++) {
+        const len = Math.max(A[c * 5 + 2], A[c * 5 + 3]), area = A[c * 5 + 4];
+        const thick = area / Math.max(len, 1), mBH = sumBH[c] / area, onHair = sumHair[c] / area > 0.5;
+        // ความตรง: อัตราส่วน eigenvalue ของการกระจายพิกเซล (เล็ก = เส้นตรงบาง)
+        const ex = mX[c] / area, ey = mY[c] / area;
+        const cxx = mXX[c] / area - ex * ex, cyy = mYY[c] / area - ey * ey, cxy = mXY[c] / area - ex * ey;
+        const dd = Math.sqrt((cxx - cyy) * (cxx - cyy) + 4 * cxy * cxy);
+        const l1 = (cxx + cyy + dd) / 2, l2 = (cxx + cyy - dd) / 2;
+        const straight = l2 / Math.max(l1, 1e-6) < 0.02;
+        const frameLike = len >= 25 * f && thick <= 2.5 * f + 2 && straight;   // ก้านแว่น / กรอบ (+2px เผื่อ blur)
+        const nearEye = sumEye[c] / area > 0.5;
+        if (onHair || !nearEye) keep[c] = frameLike ? 1 : 0;
+        else keep[c] = (len >= 12 * f && area >= 10 * f * f) || (mBH >= 35 && len >= 6 * f) ? 1 : 0;
+      }
+      const flf = new Float32Array(M);
       for (let j = 0; j < M; j++) flf[j] = keep[L32[j]];
       const flb = gaussF(flf, rw, rh, 0.7 * f);
       for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
@@ -821,16 +963,32 @@ function renderPerson(st, p) {
     const cs = new cv.MatVector(), hi2 = new cv.Mat();
     cv.findContours(ed, cs, hi2, cv.RETR_LIST, cv.CHAIN_APPROX_NONE);
     const ce = morphU8(clothH, w, h, 'erode', odd(5 * f));
-    const minLen = 60 * f * (1 + 2 * p.fineSuppress);
+    // ให้คะแนนเส้น: ความยาว + ความต่างของโทนตามเส้น + ความหนาแน่นของ texture รอบ ๆ
+    // (ไม่ใช้ความยาวอย่างเดียว) เส้นยาวมาก = ขอบชุด/ตรา เก็บเสมอ
+    const gxm = new cv.Mat(), gym = new cv.Mat();
+    cv.Sobel(half, gxm, cv.CV_32F, 1, 0); cv.Sobel(half, gym, cv.CV_32F, 0, 1);
+    const GXh = gxm.data32F, GYh = gym.data32F;
+    const minLen = 45 * f * (1 + 1.5 * p.fineSuppress);
     const keep = new cv.MatVector();
     for (let c = 0; c < cs.size(); c++) {
-      const cnt = cs.get(c), d = cnt.data32S, mid = (d.length >> 2) << 1;
+      const cnt = cs.get(c), d = cnt.data32S, np2 = d.length >> 1, mid = (np2 >> 1) << 1;
       const x = Math.min(w - 1, d[mid] * 2), y = Math.min(h - 1, d[mid + 1] * 2);
-      if (ce[y * w + x] && cv.arcLength(cnt, false) * 2 >= minLen) {
-        const ap = new cv.Mat(); cv.approxPolyDP(cnt, ap, 0.8, false); keep.push_back(ap); ap.delete();
+      const len = cv.arcLength(cnt, false) * 2;
+      if (ce[y * w + x] && len >= minLen) {
+        let gs = 0, ds = 0;
+        for (let k = 0; k < np2; k++) {
+          const hx = d[2 * k], hy = d[2 * k + 1], j = hy * hw + hx;
+          gs += Math.sqrt(GXh[j] * GXh[j] + GYh[j] * GYh[j]);
+          ds += dens[Math.min(h - 1, hy * 2) * w + Math.min(w - 1, hx * 2)];
+        }
+        const contrast = gs / np2 / 4, density = ds / np2;   // Sobel 3x3 ~ 4x ความต่างต่อพิกเซล
+        const structural = len >= 2.5 * minLen ||
+          (density < TEX.densityHigh && contrast >= 10 && (len >= minLen * (1 + density / TEX.densityLow * 0.5)));
+        if (structural) { const ap = new cv.Mat(); cv.approxPolyDP(cnt, ap, 0.8, false); keep.push_back(ap); ap.delete(); }
       }
       cnt.delete();
     }
+    gxm.delete(); gym.delete();
     const cimg = cv.Mat.zeros(hh, hw, cv.CV_8U);
     if (keep.size()) cv.polylines(cimg, keep, false, new cv.Scalar(255), 1, cv.LINE_AA);
     const cf = new Float32Array(hw * hh), CD = cimg.data;
