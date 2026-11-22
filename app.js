@@ -9,22 +9,22 @@ const UNDO_LIMIT = 30;
 
 // [key, label, min, max, step, default]
 const PARAMS = [
-  ['smooth',    'ลบริ้วรอย',                 0,   1,   0.01, 0.45],
-  ['levels',    'จำนวนระดับเงา',             2,   10,  1,    5],
-  ['posterize', 'ความเป็นก้อนเงา',            0,   1,   0.01, 0.55],
-  ['detail',    'รายละเอียดผม/ผ้า',          0,   2,   0.05, 0.9],
-  ['ink',       'เส้นขอบ',                   0,   1,   0.01, 0.35],
-  ['tint',      'สีฟ้าในเงา',                0,   0.5, 0.01, 0.12],
-  ['black',     'จุดดำสุด (กันดำสนิท)',       0,   80,  1,    22],
-  ['white',     'จุดขาวสุด (กันขาวโพลน)',     180, 255, 1,    238],
-  ['gamma',     'แกมมา (>1 มืดลง)',          0.5, 2,   0.05, 1.0],
-  ['shards',    'จำนวนเศษกระจก',             0,   80,  1,    25],
-  ['band',      'ลบพื้นหลังเดิมที่ขอบ (px)',    0,   60,  1,    30],
-  ['protect',   'ปกป้องจมูก/ส่วนหนา (px)',     0,   20,  1,    7],
+  ['smooth',    'Skin smoothing',            0,   1,   0.01, 0.45],
+  ['levels',    'Shadow levels',             2,   10,  1,    5],
+  ['posterize', 'Posterize strength',        0,   1,   0.01, 0.55],
+  ['detail',    'Hair/fabric detail',        0,   2,   0.05, 0.9],
+  ['ink',       'Ink lines',                 0,   1,   0.01, 0.35],
+  ['tint',      'Blue tint in shadows',      0,   0.5, 0.01, 0.12],
+  ['black',     'Black point',               0,   80,  1,    22],
+  ['white',     'White point',               180, 255, 1,    238],
+  ['gamma',     'Gamma (>1 = darker)',       0.5, 2,   0.05, 1.0],
+  ['shards',    'Glass shards',              0,   80,  1,    25],
+  ['band',      'Edge cleanup (px)',         0,   60,  1,    30],
+  ['protect',   'Protect nose/solid parts (px)', 0,   20,  1,    7],
 ];
 const BRUSH_PARAMS = [
-  ['brush', 'ขนาดแปรง (px)', 4, 200, 2, 40],
-  ['zoom',  'ซูม (%)',       100, 400, 25, 100],
+  ['brush', 'Brush size (px)', 4, 200, 2, 40],
+  ['zoom',  'Zoom (%)',      100, 400, 25, 100],
 ];
 
 const $ = (id) => document.getElementById(id);
@@ -49,7 +49,7 @@ worker.onmessage = (e) => {
   waiting.delete(id);
   if (ok) w.res({ ...result, ms }); else w.rej(new Error(error));
 };
-worker.onerror = (e) => setStatus('worker ผิดพลาด: ' + e.message);
+worker.onerror = (e) => setStatus('Worker error: ' + e.message);
 function call(type, payload, transfer = []) {
   return new Promise((res, rej) => {
     const id = ++reqId;
@@ -70,14 +70,14 @@ async function pump() {
   const kind = pending;
   pending = null;
   busy = true;
-  setStatus('กำลังประมวลผล...');
+  setStatus('Processing...');
   try {
     const r = await call(kind, { p: getParams(), seed, edits: hasEdits ? edits : null, editsVer });
     show(r);
-    setStatus(`เสร็จ (${r.w}×${r.h}, ${r.ms} ms)`);
+    setStatus(`Done (${r.w}×${r.h}, ${r.ms} ms)`);
   } catch (err) {
     console.error(err);
-    setStatus('เกิดข้อผิดพลาด: ' + err.message);
+    setStatus('Error: ' + err.message);
   }
   busy = false;
   pump();
@@ -285,14 +285,14 @@ function setupBrush() {
 
 // ------------------------------------------------------------ อัปโหลด / ดาวน์โหลด
 async function onFile(f) {
-  if (!f.type.startsWith('image/')) throw new Error('ไฟล์นี้ไม่ใช่รูปภาพ');
-  if (f.size > MAX_FILE_MB * 1024 * 1024) throw new Error(`ไฟล์ใหญ่เกิน ${MAX_FILE_MB} MB`);
+  if (!f.type.startsWith('image/')) throw new Error('This file is not an image');
+  if (f.size > MAX_FILE_MB * 1024 * 1024) throw new Error(`File is larger than ${MAX_FILE_MB} MB`);
   const bmp = await createImageBitmap(f, { imageOrientation: 'from-image' });
-  if (bmp.width * bmp.height > MAX_PIXELS) { bmp.close(); throw new Error('ภาพความละเอียดสูงเกินไป'); }
+  if (bmp.width * bmp.height > MAX_PIXELS) { bmp.close(); throw new Error('Image resolution is too high'); }
 
   loaded = false;
   $('download').disabled = true;
-  setStatus('กำลังตัดพื้นหลัง...');
+  setStatus('Removing background...');
 
   // ภาพสำหรับ worker (ย่อเหลือ EXPORT_MAX)
   const s = Math.min(1, EXPORT_MAX / Math.max(bmp.width, bmp.height));
@@ -324,7 +324,7 @@ async function onFile(f) {
 
 async function download() {
   $('download').disabled = true;
-  setStatus('กำลังสร้างภาพความละเอียดเต็ม...');
+  setStatus('Rendering full resolution image...');
   try {
     const r = await call('export', { p: getParams(), seed, edits: hasEdits ? edits : null, exportMax: EXPORT_MAX });
     const c = document.createElement('canvas');
@@ -337,10 +337,10 @@ async function download() {
       a.click();
       setTimeout(() => URL.revokeObjectURL(a.href), 5000);
     }, 'image/png');
-    setStatus(`ดาวน์โหลดแล้ว (${r.w}×${r.h}, ${r.ms} ms)`);
+    setStatus(`Downloaded (${r.w}×${r.h}, ${r.ms} ms)`);
   } catch (err) {
     console.error(err);
-    setStatus('ดาวน์โหลดไม่สำเร็จ: ' + err.message);
+    setStatus('Download failed: ' + err.message);
   }
   $('download').disabled = false;
 }
@@ -365,17 +365,17 @@ async function init() {
     if (!f) return;
     try { await onFile(f); } catch (err) {
       console.error(err);
-      setStatus('เกิดข้อผิดพลาด: ' + err.message);
+      setStatus('Error: ' + err.message);
     }
   });
 
   try {
     await call('init');
     $('file').disabled = false;
-    setStatus('พร้อมแล้ว เลือกรูปเพื่อเริ่ม');
+    setStatus('Ready. Choose a photo to start.');
   } catch (err) {
     console.error(err);
-    setStatus('โหลดไม่สำเร็จ: ' + err.message);
+    setStatus('Failed to load: ' + err.message);
   }
 }
 

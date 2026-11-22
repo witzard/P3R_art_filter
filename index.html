@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="th">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -36,36 +36,36 @@
 <div class="row">
   <input type="file" id="file" accept="image/*" disabled>
 </div>
-<div id="status">กำลังโหลด OpenCV และโมเดลตัดพื้นหลัง...</div>
+<div id="status">Loading OpenCV and background removal model...</div>
 
 <div class="wrap">
   <div class="panel">
     <fieldset>
-      <legend>ปรับภาพ</legend>
+      <legend>Adjust image</legend>
       <div id="sliders"></div>
       <div class="row">
-        <label>สีพื้นหลัง <input type="color" id="bg" value="#12acf4"></label>
+        <label>Background color <input type="color" id="bg" value="#12acf4"></label>
       </div>
-      <button id="reseed">สุ่มเศษกระจกใหม่</button>
-      <button id="reset">ค่าเริ่มต้น</button>
+      <button id="reseed">Shuffle glass shards</button>
+      <button id="reset">Reset to defaults</button>
     </fieldset>
 
     <fieldset>
-      <legend>แก้การตัดพื้นหลัง</legend>
+      <legend>Fix background cutout</legend>
       <div class="modes row">
-        <label><input type="radio" name="mode" value="view" checked> เลื่อน/ดู</label>
-        <label><input type="radio" name="mode" value="add"> ระบายเพิ่ม</label>
-        <label><input type="radio" name="mode" value="erase"> ระบายลบ</label>
+        <label><input type="radio" name="mode" value="view" checked> Pan/view</label>
+        <label><input type="radio" name="mode" value="add"> Paint to keep</label>
+        <label><input type="radio" name="mode" value="erase"> Paint to remove</label>
       </div>
       <div id="brushSliders"></div>
-      <label style="font-size:14px"><input type="checkbox" id="showMask"> แสดงพื้นที่ที่ถูกตัด (สีแดง)</label><br>
-      <button id="undo" disabled>ย้อนกลับ</button>
-      <button id="clearEdits" disabled>ล้างที่ระบาย</button>
-      <div class="hint">ระบายเพิ่ม = เอาส่วนที่ AI ตัดเกินกลับมา, ระบายลบ = ลบพื้นหลังที่ AI ตัดไม่หมด</div>
+      <label style="font-size:14px"><input type="checkbox" id="showMask"> Show removed areas (red)</label><br>
+      <button id="undo" disabled>Undo</button>
+      <button id="clearEdits" disabled>Clear painting</button>
+      <div class="hint">Paint to keep = restore parts the AI cut off. Paint to remove = erase background the AI missed.</div>
     </fieldset>
 
-    <label style="font-size:14px"><input type="checkbox" id="showOrig"> ดูภาพต้นฉบับ</label><br>
-    <button id="download" disabled>ดาวน์โหลด PNG (ความละเอียดเต็ม)</button>
+    <label style="font-size:14px"><input type="checkbox" id="showOrig"> Show original</label><br>
+    <button id="download" disabled>Download PNG (full resolution)</button>
   </div>
 
   <div class="view">
