@@ -129,8 +129,8 @@ function headBox(mask, w, h) {
   let xmin = w, xmax = -1;
   for (let y = hy0; y < hy1; y++) for (let x = 0; x < w; x++)
     if (mask[y * w + x] >= 0.5) { if (x < xmin) xmin = x; if (x > xmax) xmax = x; }
-  const cx = xmax >= 0 ? (xmin + xmax) / 2 : w / 2, cy = (hy0 + hy1) / 2;
-  const side = 1.25 * Math.max(hy1 - hy0, xmax >= 0 ? xmax - xmin : 0);
+  const side = 1.5 * Math.max(hy1 - hy0, xmax >= 0 ? xmax - xmin : 0);
+  const cx = xmax >= 0 ? (xmin + xmax) / 2 : w / 2, cy = (hy0 + hy1) / 2 + 0.08 * side; // เลื่อนลงให้รวมคอ แต่ยังเหลือขอบบนหัว
   const X0 = Math.max(0, Math.floor(cx - side / 2)), Y0 = Math.max(0, Math.floor(cy - side / 2));
   const X1 = Math.min(w, Math.floor(cx + side / 2)), Y1 = Math.min(h, Math.floor(cy + side / 2));
   if (X1 - X0 < 16 || Y1 - Y0 < 16) return null;
@@ -152,7 +152,8 @@ async function runParse(bitmap, box) {
     for (let ch = 0; ch < 3; ch++) t[ch * S * S + p] = (d[p * 4 + ch] / 255 - mean[ch]) / std[ch];
   const res = await parseSession.run({ [parseSession.inputNames[0]]: new ort.Tensor('float32', t, [1, 3, S, S]) });
   const o = res[parseSession.outputNames[0]].data, P = S * S;
-  const G = { hair: [17], skin: [1, 7, 8, 10, 14, 15], mouth: [11], feat: [2, 3, 4, 5, 6, 12, 13], cloth: [16, 18] };
+  const G = { hair: [17], skin: [1, 7, 8, 10, 14, 15], mouth: [11], feat: [2, 3, 4, 5, 6, 12, 13], cloth: [16, 18],
+              brow: [2, 3], eye: [4, 5, 6], lip: [12, 13], nose: [10], neck: [14, 15], face: [1] };
   const groups = {};
   for (const k in G) groups[k] = new Float32Array(P);
   const e = new Float32Array(19);
@@ -169,24 +170,35 @@ async function runParse(bitmap, box) {
 // แผนที่บริเวณ (hair/skin/mouth/feat/cloth) ที่ขนาดของ state นี้
 function buildRegions(st) {
   const { w, h, raw } = st, N = w * h;
-  const reg = { hair: new Float32Array(N), skin: new Float32Array(N), mouth: new Float32Array(N),
-                feat: new Float32Array(N), cloth: new Float32Array(N) };
+  const keys = ['hair', 'skin', 'mouth', 'feat', 'cloth', 'brow', 'eye', 'lip', 'nose', 'neck', 'face'];
+  const reg = {};
+  for (const k of keys) reg[k] = new Float32Array(N);
   st.reg = reg; st.hasRegions = false;
   if (!parse) return;
   const X0 = Math.round(parse.box[0] * w), Y0 = Math.round(parse.box[1] * h);
-  const cw = Math.max(1, Math.round(parse.box[2] * w) - X0), ch = Math.max(1, Math.round(parse.box[3] * h) - Y0);
-  for (const k in reg) {
-    const r = resizeF(parse.groups[k], 512, 512, cw, ch);
-    for (let y = 0; y < ch && Y0 + y < h; y++)
-      for (let x = 0; x < cw && X0 + x < w; x++) {
+  const X1 = Math.min(w, Math.round(parse.box[2] * w)), Y1 = Math.min(h, Math.round(parse.box[3] * h));
+  const cw = Math.max(1, X1 - X0), ch = Math.max(1, Y1 - Y0);
+  // ค่อย ๆ จางออกที่ขอบ crop (ไม่ใช่ขอบภาพ) กันรอยต่อเป็นเส้นตรง
+  const fy = 0.08 * ch, fx = 0.08 * cw;
+  const fade = (x, y) => {
+    let d = 1;
+    if (Y0 > 0) d = Math.min(d, y / fy);
+    if (Y1 < h) d = Math.min(d, (ch - 1 - y) / fy);
+    if (X0 > 0) d = Math.min(d, x / fx);
+    if (X1 < w) d = Math.min(d, (cw - 1 - x) / fx);
+    return clamp01(d);
+  };
+  for (const k of keys) {
+    const r = resizeF(parse.groups[k], 512, 512, cw, ch), dst = reg[k];
+    for (let y = 0; y < ch; y++)
+      for (let x = 0; x < cw; x++) {
         const i = (Y0 + y) * w + X0 + x;
-        reg[k][i] = clamp01(r[y * cw + x]) * raw[i];
+        dst[i] = clamp01(r[y * cw + x]) * fade(x, y) * raw[i];
       }
   }
-  // ตรวจว่าเป็นหน้าคนจริง (มีผิวพอสมควร) ไม่งั้นใช้แบบไม่มีบริเวณ (fallback)
   let sk = 0;
   for (let i = 0; i < N; i++) sk += reg.skin[i];
-  if (sk < 0.01 * cw * ch) { for (const k in reg) reg[k].fill(0); return; }
+  if (sk < 0.01 * cw * ch) { for (const k of keys) reg[k].fill(0); return; }
   st.hasRegions = true;
 }
 
@@ -421,54 +433,98 @@ function u8Mat(w, h, src) {
 function ellipse(n) { return cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(n, n)); }
 function median8(m, k) { const d = new cv.Mat(); cv.medianBlur(m, d, k); m.delete(); return d; }
 
-// cel shading ของบริเวณหนึ่ง: quantize -> median merge -> ลบ region เล็ก -> palette
-// ทำที่ครึ่งความละเอียด (เงาเป็นก้อนใหญ่อยู่แล้ว) แล้วขยายกลับ: เร็วขึ้น ~4 เท่า
-function cel(st, vv, Lr, kFull, minFrac, loFrac, p) {
-  const W = st.w, Hh = st.h;
-  const w = Math.max(1, W >> 1), h = Math.max(1, Hh >> 1), N = w * h;
-  const k = odd(kFull / 2);
-  const vm = newF32(W, Hh, vv), vs = new cv.Mat();
-  cv.resize(vm, vs, new cv.Size(w, h), 0, 0, cv.INTER_AREA);
-  const V = vs.data32F;
-  const step = Math.floor(255 / Math.max(Lr - 1, 1));
-  let lab = new cv.Mat(h, w, cv.CV_8U);
-  const LD0 = lab.data;
-  for (let i = 0; i < N; i++) LD0[i] = Math.min(Math.floor(V[i] * Lr), Lr - 1) * step;
-  vm.delete(); vs.delete();
-  lab = median8(median8(lab, k), k);
-  if (p.smallRegion > 0) {
-    const minArea = p.smallRegion * minFrac * N;
-    const fill = new cv.Mat();
-    cv.medianBlur(lab, fill, odd(k * 2.5));
-    const small = new Uint8Array(N);
-    const bin = new cv.Mat(h, w, cv.CV_8U), labels = new cv.Mat(), stats = new cv.Mat(), cents = new cv.Mat();
-    const LD = lab.data, BD = bin.data;
-    for (let l = 0; l < Lr; l++) {
-      const val = l * step;
-      let present = false;
-      for (let i = 0; i < N; i++) { const b = LD[i] === val ? 1 : 0; BD[i] = b; if (b) present = true; }
-      if (!present) continue;
-      const n = cv.connectedComponentsWithStats(bin, labels, stats, cents, 8, cv.CV_32S);
-      const A = stats.data32S, bad = new Uint8Array(n);
-      let any = false;
-      for (let c = 1; c < n; c++) if (A[c * 5 + 4] < minArea) { bad[c] = 1; any = true; }
-      if (any) { const L32 = labels.data32S; for (let i = 0; i < N; i++) if (bad[L32[i]]) small[i] = 1; }
-    }
-    const FD = fill.data;
-    for (let i = 0; i < N; i++) if (small[i]) LD[i] = FD[i];
-    fill.delete(); bin.delete(); labels.delete(); stats.delete(); cents.delete();
-  }
-  const pal = [];
-  for (let l = 0; l < Lr; l++)
-    pal.push(p.black + (p.white - p.black) * (loFrac + (1 - loFrac) * Math.pow(l / Math.max(Lr - 1, 1), 0.9)));
-  const outS = new cv.Mat(h, w, cv.CV_32F), OD = outS.data32F, LD2 = lab.data;
-  for (let i = 0; i < N; i++) OD[i] = pal[Math.min(Lr - 1, Math.round(LD2[i] / step))];
-  lab.delete();
-  const big = new cv.Mat();
-  cv.resize(outS, big, new cv.Size(W, Hh), 0, 0, cv.INTER_LINEAR);
-  const out = big.data32F.slice();
-  outS.delete(); big.delete();
+// ------------------------------------------------------------ ROI helpers (ประมวลผลเฉพาะกรอบที่จำเป็น)
+function bboxOf(arr, w, h, t, pad) {
+  let x0 = w, y0 = h, x1 = -1, y1 = -1;
+  for (let y = 0; y < h; y++) { const r = y * w; for (let x = 0; x < w; x++) if (arr[r + x] > t) {
+    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; } }
+  if (x1 < 0) return null;
+  x0 = Math.max(0, x0 - pad); y0 = Math.max(0, y0 - pad); x1 = Math.min(w - 1, x1 + pad); y1 = Math.min(h - 1, y1 + pad);
+  return { x0, y0, rw: x1 - x0 + 1, rh: y1 - y0 + 1 };
+}
+function subU8(src, w, bb) {
+  const m = new cv.Mat(bb.rh, bb.rw, cv.CV_8U), D = m.data;
+  for (let y = 0; y < bb.rh; y++) { const r = (bb.y0 + y) * w + bb.x0; for (let x = 0; x < bb.rw; x++) {
+    const v = src[r + x]; D[y * bb.rw + x] = v < 0 ? 0 : v > 255 ? 255 : v; } }
+  return m;
+}
+
+// ------------------------------------------------------------ morphology helpers (Uint8 0/1 arrays)
+function morphU8(arr, w, h, op, k, shape = 'rect') {
+  if (k < 2) return arr.slice();
+  const m = new cv.Mat(h, w, cv.CV_8U); m.data.set(arr);
+  const ker = shape === 'ellipse' ? ellipse(k | 1) : cv.Mat.ones(k, k, cv.CV_8U);
+  const d = new cv.Mat();
+  if (op === 'dilate') cv.dilate(m, d, ker);
+  else if (op === 'erode') cv.erode(m, d, ker);
+  else cv.morphologyEx(m, d, op === 'close' ? cv.MORPH_CLOSE : cv.MORPH_OPEN, ker);
+  const out = d.data.slice();
+  m.delete(); d.delete(); ker.delete();
   return out;
+}
+function boundaryU8(B, w, h, width) {
+  const d = morphU8(B, w, h, 'dilate', width), out = new Float32Array(B.length);
+  for (let i = 0; i < B.length; i++) out[i] = d[i] - B[i];
+  return out;
+}
+// ลบ component ที่เล็กกว่า minArea (value=1: เกาะ, value=0: รูภายใน region)
+function removeSmall(M, R, w, h, minArea, value) {
+  const N = w * h, b = new cv.Mat(h, w, cv.CV_8U), BD = b.data;
+  for (let i = 0; i < N; i++) BD[i] = value ? M[i] : (!M[i] && R[i] ? 1 : 0);
+  const labels = new cv.Mat(), stats = new cv.Mat(), cents = new cv.Mat();
+  const n = cv.connectedComponentsWithStats(b, labels, stats, cents, 8, cv.CV_32S);
+  const A = stats.data32S, small = new Uint8Array(n);
+  let any = false;
+  for (let c = 1; c < n; c++) if (A[c * 5 + 4] < minArea) { small[c] = 1; any = true; }
+  if (any) { const L32 = labels.data32S; for (let i = 0; i < N; i++) if (small[L32[i]]) M[i] = value ? 0 : 1; }
+  b.delete(); labels.delete(); stats.delete(); cents.delete();
+}
+function percentileOf(vals, mask, q) {
+  const hist = new Uint32Array(1024);
+  let n = 0;
+  for (let i = 0; i < vals.length; i++) if (mask[i]) { hist[Math.min(1023, Math.max(0, Math.floor(vals[i] * 1023)))]++; n++; }
+  if (!n) return 0.5;
+  let acc = 0;
+  for (let b = 0; b < 1024; b++) { acc += hist[b]; if (acc >= n * q) return b / 1023; }
+  return 1;
+}
+
+// โทนของบริเวณหนึ่งด้วย "nested tone masks": M_k = v >= t_k (ภายใน region)
+// แต่ละ mask: closing/opening -> ลบเกาะและรูเล็ก (ตามสัดส่วนพื้นที่ภาพ) -> blur+threshold ให้ขอบเรียบ
+// บังคับซ้อนกัน (M_k+1 อยู่ใน M_k) ทำที่ครึ่งความละเอียดแล้วขยายกลับ
+function toneRegion(st, vv, region, th, pal, rClose, rOpen, minArea, sigma, hard) {
+  const W = st.w, H = st.h, w = Math.max(1, W >> 1), h = Math.max(1, H >> 1), N = w * h;
+  const vm = newF32(W, H, vv), vs = new cv.Mat();
+  cv.resize(vm, vs, new cv.Size(w, h), 0, 0, cv.INTER_AREA);
+  const V = vs.data32F.slice();
+  vm.delete(); vs.delete();
+  const rf = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) rf[i] = region[i];
+  const rh = resizeF(rf, W, H, w, h), R = new Uint8Array(N);
+  for (let i = 0; i < N; i++) R[i] = rh[i] > 0.5 ? 1 : 0;
+  const rc = Math.round(rClose / 2), ro = Math.round(rOpen / 2), ma = minArea / 4, sg = Math.max(0.5, sigma / 2);
+  const ramp = 1.5 + 6 * hard;
+  const acc = new Float32Array(N).fill(pal[0]);
+  let prev = R, alphaPrev = null;
+  for (let k = 0; k < th.length; k++) {
+    let M = new Uint8Array(N);
+    for (let i = 0; i < N; i++) M[i] = V[i] >= th[k] && prev[i] ? 1 : 0;
+    if (rc > 0) M = morphU8(M, w, h, 'close', 2 * rc + 1, 'ellipse');
+    if (ro > 0) M = morphU8(M, w, h, 'open', 2 * ro + 1, 'ellipse');
+    for (let i = 0; i < N; i++) M[i] &= R[i];
+    removeSmall(M, R, w, h, ma, 1);
+    removeSmall(M, R, w, h, ma, 0);
+    const A = gaussF(Float32Array.from(M), w, h, sg);
+    const alpha = new Float32Array(N), next = new Uint8Array(N), dp = pal[k + 1] - pal[k];
+    for (let i = 0; i < N; i++) {
+      let a = clamp01((A[i] - 0.5) * ramp + 0.5);
+      a = Math.min(a, k === 0 ? prev[i] : alphaPrev[i]);
+      acc[i] += a * dp; alpha[i] = a;
+      next[i] = A[i] > 0.5 && prev[i] ? 1 : 0;
+    }
+    prev = next; alphaPrev = alpha;
+  }
+  return resizeF(acc, w, h, W, H);
 }
 
 function renderPerson(st, p) {
@@ -500,27 +556,35 @@ function renderPerson(st, p) {
   const Sf = Float32Array.from(st.simp);
 
   // 2. Hair: รวมเส้นผมเป็นก้อน (median + closing/opening + bilateral)
-  if (hasHair && hc > 0) {
-    let H = u8Mat(w, h, st.simp);
+  const bbHair = hasHair && hc > 0 ? bboxOf(hair, w, h, 0.01, Math.round(12 * f)) : null;
+  if (bbHair) {
+    let H = subU8(st.simp, w, bbHair);
     H = median8(H, odd((5 + 10 * hc) * f));
     const k = ellipse(odd(3 + 6 * hc * f));
     cv.morphologyEx(H, H, cv.MORPH_CLOSE, k);
     cv.morphologyEx(H, H, cv.MORPH_OPEN, k);
     const Hb = new cv.Mat();
     cv.bilateralFilter(H, Hb, Math.max(1, Math.round(9 * f)), 40, 9 * f);
-    const __d18 = Hb.data;
-    for (let i = 0; i < N; i++) { const a = hair[i] * hc; Sf[i] = Sf[i] * (1 - a) + __d18[i] * a; }
+    const HD = Hb.data, { x0, y0, rw, rh } = bbHair;
+    for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+      const i = (y0 + y) * w + x0 + x, a = hair[i] * hc;
+      Sf[i] = Sf[i] * (1 - a) + HD[y * rw + x] * a;
+    }
     H.delete(); Hb.delete(); k.delete();
   }
 
   // 3. Face: เกลี่ยผิวเพิ่ม แต่เก็บตา/คิ้ว/ปาก
-  if (hasSkin && fs > 0) {
-    const g = u8Mat(w, h, st.simp), F1 = new cv.Mat(), F2 = new cv.Mat();
+  const bbSkin = hasSkin && fs > 0 ? bboxOf(skin, w, h, 0.01, Math.round(12 * f)) : null;
+  if (bbSkin) {
+    const g = subU8(st.simp, w, bbSkin), F1 = new cv.Mat(), F2 = new cv.Mat();
     const d = Math.max(1, Math.round(11 * f));
     cv.bilateralFilter(g, F1, d, 25 + 35 * fs, 11 * f);
     cv.bilateralFilter(F1, F2, d, 25 + 35 * fs, 11 * f);
-    const __d19 = F2.data;
-    for (let i = 0; i < N; i++) { const a = skin[i] * fs * (1 - feat[i] * fp); Sf[i] = Sf[i] * (1 - a) + __d19[i] * a; }
+    const FD = F2.data, { x0, y0, rw, rh } = bbSkin;
+    for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+      const i = (y0 + y) * w + x0 + x, a = skin[i] * fs * (1 - feat[i] * fp);
+      Sf[i] = Sf[i] * (1 - a) + FD[y * rw + x] * a;
+    }
     g.delete(); F1.delete(); F2.delete();
   }
   // ฟัน: ปิดร่องมืดระหว่างฟันเฉพาะในช่องปาก เก็บขอบปากไว้
@@ -555,165 +619,230 @@ function renderPerson(st, p) {
     }
   }
 
+  // ขอบ silhouette ปนสีพื้นหลังเดิม: แทนค่าในแถบขอบด้วยค่าเฉลี่ยของเนื้อด้านใน
+  // (normalized convolution: เร็วกว่า inpaint มาก ผลใกล้เคียงกัน) กันขอบขาว/halo
+  if (st.band) {
+    const BD = st.band.data, inner = new Float32Array(N), num = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const a = !BD[i] && mask[i] > 0.5 ? 1 : 0; inner[i] = a; num[i] = Sf[i] * a; }
+    const nb = gaussF(num, w, h, 4 * f), db = gaussF(inner, w, h, 4 * f);
+    for (let i = 0; i < N; i++) if (BD[i] && db[i] > 1e-3) Sf[i] = nb[i] / db[i];
+  }
+
   // 4. Tone normalization (percentile ของตัวคน) + gamma
   const hist = new Array(256).fill(0);
   let n = 0;
   for (let i = 0; i < N; i++) if (mask[i] > 0.5) { hist[Math.max(0, Math.min(255, Math.round(Sf[i])))]++; n++; }
   let lo = 0, hi = 255;
   if (n > 100) { lo = percentileFromHist(hist, n, 0.02); hi = percentileFromHist(hist, n, 0.98); }
-  const med = n > 100 ? percentileFromHist(hist, n, 0.5) : 128;
   const v = new Float32Array(N);
   for (let i = 0; i < N; i++) v[i] = Math.pow(clamp01((Sf[i] - lo) / Math.max(hi - lo, 1)), p.gamma);
 
-  // 5. Cel shading แยกตามบริเวณ
-  const L = p.levels;
-  let tone = cel(st, v, L, odd((3 + 10 * p.shadowMerge) * f), 0.0012, 0, p);
-  if (hasSkin) {
-    const vb = gaussF(v, w, h, 14 * f), vs = new Float32Array(N);
-    for (let i = 0; i < N; i++) vs[i] = v[i] * (1 - 0.7 * fs) + vb[i] * 0.7 * fs;
-    const ts = cel(st, vs, Math.min(L, 3), odd((7 + 16 * fs) * f), 0.004, 0.35, p); // เงาผิวไม่ดำสนิท
-    for (let i = 0; i < N; i++) { const a = skin[i] * (1 - feat[i] * fp); tone[i] = tone[i] * (1 - a) + ts[i] * a; }
-  }
-  if (hasHair && hc > 0) {
-    const vb = gaussF(v, w, h, 6 * f), vh = new Float32Array(N);
-    for (let i = 0; i < N; i++) vh[i] = (v[i] * (1 - 0.5 * hc) + vb[i] * 0.5 * hc) * (1 - 0.6 * hc); // ผมเป็นก้อนเข้ม ไฮไลต์เป็นโทนกลาง
-    const th = cel(st, vh, hc > 0.4 ? Math.min(L, 3) : L, odd((7 + 22 * hc) * f), 0.004, 0, p);
-    for (let i = 0; i < N; i++) tone[i] = tone[i] * (1 - hair[i]) + th[i] * hair[i];
-  }
-  tone = gaussF(tone, w, h, (1 - p.shadingHardness) * 4 * f + 0.6 * f);
-  const hd = p.shadingHardness;
-  for (let i = 0; i < N; i++)
-    tone[i] = tone[i] * (0.85 + 0.15 * hd) + (p.black + v[i] * (p.white - p.black)) * (0.15 - 0.15 * hd);
-
-  // 6. คืนรายละเอียดแบบเลือกบริเวณ: ผิวแทบไม่คืน, ผ้าคืนปานกลาง, ผมคืนเฉพาะโครงหยาบ
+  // 5. โทนแบบ nested masks แยกตามบริเวณ (ไม่รวมข้ามขอบ ผม / หน้า / เสื้อผ้า)
+  const L = p.levels, hard = p.shadingHardness, rng = p.white - p.black;
+  const merge = p.shadowMerge, sup = p.smallRegion;
+  const palOf = (cnt, a = 0, b = 1) => Array.from({ length: cnt }, (_, i) =>
+    p.black + rng * (a + (b - a) * Math.pow(i / Math.max(cnt - 1, 1), 0.9)));
+  const hairH = new Uint8Array(N), faceH = new Uint8Array(N), clothH = new Uint8Array(N);
   for (let i = 0; i < N; i++) {
-    const cloth = clamp01(mask[i] - hair[i] - skin[i] - feat[i] - mouth[i]);
-    const wd = skin[i] * 0.03 + cloth * 0.35 + feat[i] * 0.3;
-    tone[i] += p.detail * (st.hp[i] * wd + st.hpc[i] * hair[i] * p.hairDetail * 0.6);
+    hairH[i] = hair[i] > 0.5 ? 1 : 0;
+    faceH[i] = !hairH[i] && skin[i] + feat[i] + mouth[i] > 0.5 ? 1 : 0;
+    clothH[i] = mask[i] > 0.5 && !hairH[i] && !faceH[i] ? 1 : 0;
   }
-
-  // 7. Line art หลายระดับ
-  const mb = new cv.Mat(h, w, cv.CV_8U);
-  const __d22 = mb.data;
-  for (let i = 0; i < N; i++) __d22[i] = mask[i] > 0.5 ? 1 : 0;
-  // A. silhouette: ขอบตัว + ขอบผมกับหน้า
-  const t = Math.max(1, Math.round((1 + p.silhouette) * f * 1.5));
-  const dil = new cv.Mat(), ero = new cv.Mat();
-  const kd = cv.Mat.ones(2 * t + 1, 2 * t + 1, cv.CV_8U), ke = cv.Mat.ones(3, 3, cv.CV_8U);
-  cv.dilate(mb, dil, kd); cv.erode(mb, ero, ke);
-  const ring = new Float32Array(N);
-  const __d23 = ero.data;
-  const __d24 = mb.data;
-  const __d25 = dil.data;
-  for (let i = 0; i < N; i++) ring[i] = (__d25[i] - __d23[i]) * __d24[i];
-  let sil = gaussF(ring, w, h, 0.7 * f);
-  const sA = Math.min(1, p.silhouette * 0.7);
-  for (let i = 0; i < N; i++) sil[i] *= sA;
-  if (hasHair && hasSkin) {
-    const hb = new cv.Mat(h, w, cv.CV_8U), hd2 = new cv.Mat();
-    const __d26 = hb.data;
-    for (let i = 0; i < N; i++) __d26[i] = hair[i] > 0.5 ? 1 : 0;
-    const kh = cv.Mat.ones(odd(2 * t), odd(2 * t), cv.CV_8U);
-    cv.dilate(hb, hd2, kh);
-    const hr = new Float32Array(N);
-    const __d27 = hb.data;
-    const __d28 = hd2.data;
-    for (let i = 0; i < N; i++) hr[i] = (__d28[i] - __d27[i]) * (skin[i] > 0.3 ? 1 : 0);
-    const hrb = gaussF(hr, w, h, 0.7 * f), hA = Math.min(1, p.silhouette * 0.6);
-    for (let i = 0; i < N; i++) sil[i] = Math.max(sil[i], hrb[i] * hA);
-    hb.delete(); hd2.delete(); kh.delete();
+  const k4 = odd(4 * f);
+  const hf = new Uint8Array(N);
+  for (let i = 0; i < N; i++) hf[i] = hairH[i] | faceH[i];
+  const core = morphU8(hf, w, h, 'erode', k4);
+  const clothX = new Uint8Array(N);
+  for (let i = 0; i < N; i++) clothX[i] = mask[i] > 0.02 && !core[i] ? 1 : 0;
+  const over = (tr, region) => {
+    const wg = gaussF(Float32Array.from(region), w, h, 1.0 * f);
+    for (let i = 0; i < N; i++) tone[i] = tone[i] * (1 - wg[i]) + tr[i] * wg[i];
+  };
+  // เสื้อผ้า / ของ: ใช้ระดับเต็ม merge ปานกลาง
+  const vc = gaussF(v, w, h, 1.5 * f);
+  let tone = toneRegion(st, vc, clothX, Array.from({ length: L - 1 }, (_, k) => (k + 1) / L), palOf(L),
+    (1 + 3 * merge) * f, (1 + 2 * merge) * f, sup * 0.0015 * N, (1 + 2 * merge) * f, hard);
+  // ผม: เกณฑ์จากความสว่างของผมเอง, สว่างสุดแค่โทนกลาง-สว่าง, รวมก้อนใหญ่
+  if (hasHair) {
+    const vh = gaussF(v, w, h, (2 + 4 * hc) * f);
+    const nl = hc > 0.3 ? Math.min(3, L) : Math.min(L, 4);
+    const qs = nl === 2 ? [0.6] : nl === 3 ? [0.55, 0.9] : [0.4, 0.7, 0.92];
+    const th = qs.map((q) => percentileOf(vh, hairH, q));
+    // ขอบนอกของผม (mask มีแต่ความน่าจะเป็นผม < 0.5) ใช้ palette ของผมด้วย กันขอบสว่างแปลก ๆ
+    const hairX = morphU8(hairH, w, h, 'dilate', odd(12 * f));
+    for (let i = 0; i < N; i++) hairX[i] = hairX[i] && !faceH[i] && R.cloth[i] < 0.3 && mask[i] > 0.02 ? 1 : 0;
+    over(toneRegion(st, vh, morphU8(hairX, w, h, 'dilate', k4), th, palOf(nl, 0, 0.62),
+      (2 + 8 * hc) * f, (2 + 6 * hc) * f, (0.0015 + 0.006 * hc) * sup * N, (2 + 4 * hc) * f, hard), hairX);
   }
-  dil.delete(); ero.delete(); kd.delete(); ke.delete();
-
-  // B. structural: Canny ที่ครึ่งความละเอียด + กรองตามความยาวเส้นและบริเวณ
-  const Su = u8Mat(w, h, Sf);
-  const hw = Math.max(1, w >> 1), hh = Math.max(1, h >> 1);
-  const half = new cv.Mat(), edges = new cv.Mat();
-  cv.resize(Su, half, new cv.Size(hw, hh), 0, 0, cv.INTER_AREA);
-  cv.Canny(half, edges, 0.5 * med, 1.0 * med);
-  const contours = new cv.MatVector(), hier = new cv.Mat();
-  cv.findContours(edges, contours, hier, cv.RETR_LIST, cv.CHAIN_APPROX_NONE);
-  const fn = new cv.Mat(h, w, cv.CV_8U);
-  const __d29 = fn.data;
-  for (let i = 0; i < N; i++) __d29[i] = feat[i] > 0.3 ? 1 : 0;
-  const kf = cv.Mat.ones(odd(9 * f), odd(9 * f), cv.CV_8U);
-  cv.dilate(fn, fn, kf);
-  const sh = cv.Mat.zeros(hh, hw, cv.CV_8U);
-  const baseLen = 30 * f, thick = Math.max(1, Math.round(0.8 * f));
-  const color = new cv.Scalar(255);
-  const fnD = fn.data;
-  for (let c = 0; c < contours.size(); c++) {
-    const cnt = contours.get(c), d = cnt.data32S, np2 = d.length >> 1;
-    const mid = np2 >> 1;
-    const x = Math.min(w - 1, d[2 * mid] * 2), y = Math.min(h - 1, d[2 * mid + 1] * 2), i = y * w + x;
-    let ok = mask[i] >= 0.5, need = baseLen;
-    if (ok) {
-      if (st.hasRegions && fnD[i]) need *= 0.4 / Math.max(fp, 0.1);
-      else if (hair[i] > 0.5) need *= 2 + 6 * (1 - p.hairDetail);
-      else if (skin[i] > 0.3) ok = false; // ไม่มีเส้นภายในผิวหน้า
+  // หน้า: normalize ความสว่างผิว, ไม่เกิน 3 ระดับ, เงาไม่ต่ำกว่าเทากลาง, ลบเงาเล็ก ๆ บนแก้ม
+  if (hasSkin) {
+    const vb = gaussF(v, w, h, 14 * f), vs = new Float32Array(N), sm = new Uint8Array(N);
+    for (let i = 0; i < N; i++) { vs[i] = v[i] * (1 - 0.7 * fs) + vb[i] * 0.7 * fs; sm[i] = faceH[i] && skin[i] > 0.5 ? 1 : 0; }
+    const a5 = percentileOf(vs, sm, 0.05), a95 = percentileOf(vs, sm, 0.95);
+    for (let i = 0; i < N; i++) vs[i] = clamp01((vs[i] - a5) / Math.max(a95 - a5, 1e-3));
+    const nl = Math.min(L, 3);
+    over(toneRegion(st, vs, morphU8(faceH, w, h, 'dilate', k4), nl === 3 ? [0.22, 0.5] : [0.3], palOf(nl, 0.45, 1),
+      (3 + 6 * fs) * f, (2 + 5 * fs) * f, (0.002 + 0.006 * fs) * sup * N + 1, (2 + 3 * fs) * f, hard), faceH);
+  }
+  // คิ้ว: ก้อนเข้มก้อนเดียว / ปาก: โทนเรียบ / ฟัน: ก้อนสว่างก้อนเดียวในช่องปากสีเข้ม
+  if (st.hasRegions) {
+    const thr = (src, t) => { const o = new Uint8Array(N); for (let i = 0; i < N; i++) o[i] = src[i] > t ? 1 : 0; return o; };
+    if (mx(R.brow) > 0.3) {
+      const bm = gaussF(Float32Array.from(morphU8(thr(R.brow, 0.45), w, h, 'close', odd(3 * f))), w, h, 0.8 * f);
+      const bt = p.black + 0.18 * rng;
+      for (let i = 0; i < N; i++) { const a = bm[i] * fp; tone[i] = tone[i] * (1 - a) + bt * a; }
     }
-    if (ok && cv.arcLength(cnt, false) * 2 >= need) cv.drawContours(sh, contours, c, color, thick);
-    cnt.delete();
+    if (mx(R.lip) > 0.3) {
+      const lb = thr(R.lip, 0.5), lm = gaussF(Float32Array.from(lb), w, h, 0.8 * f);
+      const lt = p.black + rng * (0.45 + 0.35 * percentileOf(v, lb, 0.5));
+      for (let i = 0; i < N; i++) tone[i] = tone[i] * (1 - lm[i]) + lt * lm[i];
+    }
+    if (hasMouth) {
+      const mm = thr(mouth, 0.5), t45 = percentileOf(v, mm, 0.45);
+      let teeth = new Uint8Array(N);
+      for (let i = 0; i < N; i++) teeth[i] = v[i] >= t45 && mm[i] ? 1 : 0;
+      teeth = morphU8(teeth, w, h, 'close', odd(7 * f), 'ellipse');
+      for (let i = 0; i < N; i++) teeth[i] &= mm[i];
+      teeth = morphU8(teeth, w, h, 'open', odd(2 * f));
+      const tm = gaussF(Float32Array.from(teeth), w, h, 1.0 * f), gm = gaussF(Float32Array.from(mm), w, h, 0.8 * f);
+      const cav = p.black + 0.25 * rng, tt = p.black + 0.9 * rng;
+      for (let i = 0; i < N; i++) {
+        tone[i] = tone[i] * (1 - gm[i]) + cav * gm[i];
+        tone[i] = tone[i] * (1 - tm[i]) + tt * tm[i];
+      }
+    }
   }
-  const sFull = new cv.Mat();
-  cv.resize(sh, sFull, new cv.Size(w, h), 0, 0, cv.INTER_LINEAR);
-  let struct = gaussF(Float32Array.from(sFull.data), w, h, 0.7 * f);
-  for (let i = 0; i < N; i++) struct[i] = (struct[i] / 255) * p.structural * (1 - hair[i] * (1 - p.hairDetail) * 0.6);
-  half.delete(); edges.delete(); contours.delete(); hier.delete(); fn.delete(); kf.delete(); sh.delete(); sFull.delete();
+  for (let i = 0; i < N; i++) tone[i] = tone[i] * (0.9 + 0.1 * hard) + (p.black + v[i] * rng) * (0.1 - 0.1 * hard);
 
-  // B2. เส้นบาง ๆ ที่มืดบนหน้า (กรอบแว่น เปลือกตา ร่องปาก) ด้วย black-hat
-  //     เผื่อกรณี face parsing หาไม่เจอ (เช่น หน้าด้านข้าง)
+  // 6. คืนรายละเอียดเฉพาะบริเวณ: ผ้าเล็กน้อย, ผมเฉพาะโครงหยาบ, ผิวไม่คืน
+  for (let i = 0; i < N; i++)
+    tone[i] += p.detail * (st.hp[i] * clothH[i] * 0.15 + st.hpc[i] * hair[i] * p.hairDetail * 0.35);
+
+  // 7. เส้นตามลำดับความสำคัญ: silhouette > ตา/ปาก/คิ้ว/แว่น > ขอบก้อนผม > รอยพับผ้า > ผิว (ไม่มี)
+  const aa = (arr, sg = 0.6) => gaussF(arr instanceof Float32Array ? arr : Float32Array.from(arr), w, h, sg * f);
+  const mbA = new Uint8Array(N);
+  for (let i = 0; i < N; i++) mbA[i] = mask[i] > 0.5 ? 1 : 0;
+  const t = Math.max(1, Math.round((1 + p.silhouette) * f * 1.5));
+  const dl = morphU8(mbA, w, h, 'dilate', 2 * t + 1), er = morphU8(mbA, w, h, 'erode', 3);
+  const ring = new Float32Array(N);
+  for (let i = 0; i < N; i++) ring[i] = (dl[i] - er[i]) * mbA[i];
+  const sil = aa(ring, 0.7);
+  const sA = Math.min(1, p.silhouette * 0.75);
+  for (let i = 0; i < N; i++) sil[i] *= sA;
+  if (hasHair) {   // เส้นไรผมตัดกับหน้า
+    const hr = boundaryU8(hairH, w, h, Math.max(2, t));
+    for (let i = 0; i < N; i++) hr[i] *= faceH[i];
+    const hrb = aa(hr, 0.7), hA = Math.min(1, p.silhouette * 0.6);
+    for (let i = 0; i < N; i++) sil[i] = Math.max(sil[i], hrb[i] * hA);
+  }
+  const lw = Math.max(1, Math.round(1.6 * f));
+  const lf = new Float32Array(N);
+  const maxInto = (src, wgt) => { for (let i = 0; i < N; i++) { const v2 = src[i] * wgt; if (v2 > lf[i]) lf[i] = v2; } };
+  const thrU = (src, t2) => { const o = new Uint8Array(N); for (let i = 0; i < N; i++) o[i] = src[i] > t2 ? 1 : 0; return o; };
+  if (st.hasRegions) {
+    if (mx(R.eye) > 0.3) maxInto(aa(boundaryU8(morphU8(thrU(R.eye, 0.45), w, h, 'close', odd(3 * f)), w, h, lw + 1)), 1);
+    if (hasMouth) maxInto(aa(boundaryU8(thrU(mouth, 0.5), w, h, lw + 1)), 0.9);
+    if (mx(R.lip) > 0.3) maxInto(aa(boundaryU8(thrU(R.lip, 0.5), w, h, lw)), 0.35);
+    if (mx(R.neck) > 0.3 && mx(R.face) > 0.3) {   // เส้นกราม: ขอบระหว่างหน้ากับคอ
+      const nd = morphU8(thrU(R.neck, 0.5), w, h, 'dilate', lw + 2), fc = thrU(R.face, 0.5);
+      for (let i = 0; i < N; i++) nd[i] &= fc[i];
+      maxInto(aa(nd), 0.7);
+    }
+    if (mx(R.nose) > 0.3) {   // จมูก: เส้นสั้น ๆ ใต้ปลายจมูก (ขอบล่างของบริเวณจมูก) แบบอนิเมะ
+      const nb = thrU(R.nose, 0.5);
+      let y0 = h, y1 = -1;
+      for (let i = 0; i < N; i++) if (nb[i]) { const y = (i / w) | 0; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+      if (y1 > y0) {
+        const cut = y0 + 0.6 * (y1 - y0), bd = boundaryU8(nb, w, h, lw + 1);
+        for (let i = 0; i < N; i++) if ((i / w | 0) < cut) bd[i] = 0;
+        maxInto(aa(bd), 0.55);
+      }
+    }
+  }
+  // กรอบแว่น / เปลือกตา / ส่วนที่ parsing หาไม่เจอ: เส้นบางมืดด้วย black-hat
   if (fp > 0 && hasSkin) {
-    const g1 = u8Mat(w, h, gaussF(st.g0, w, h, 0.8 * f)), bh = new cv.Mat(), kb = ellipse(odd(11 * f));
-    cv.morphologyEx(g1, bh, cv.MORPH_BLACKHAT, kb);
-    const zone = new cv.Mat(h, w, cv.CV_8U);
-    const __d30 = zone.data;
-    for (let i = 0; i < N; i++) __d30[i] = skin[i] > 0.3 ? 1 : 0;
-    const kz = cv.Mat.ones(odd(41 * f), odd(41 * f), cv.CV_8U);
-    cv.dilate(zone, zone, kz);
-    const fl = new cv.Mat(h, w, cv.CV_8U);
-    const __d31 = zone.data;
-    const __d32 = bh.data;
-    const __d33 = fl.data;
-    for (let i = 0; i < N; i++)
-      __d33[i] = __d32[i] > 16 && __d31[i] && mask[i] > 0.5 && hair[i] < 0.6 && mouth[i] < 0.3 ? 1 : 0;
-    const labels = new cv.Mat(), stats = new cv.Mat(), cents = new cv.Mat();
-    const nc = cv.connectedComponentsWithStats(fl, labels, stats, cents, 8, cv.CV_32S);
-    const A = stats.data32S, keep = new Uint8Array(nc);
-    for (let c = 1; c < nc; c++)
-      keep[c] = Math.max(A[c * 5 + 2], A[c * 5 + 3]) >= 12 * f && A[c * 5 + 4] >= 10 * f * f ? 1 : 0;
-    const L32 = labels.data32S, flf = new Float32Array(N);
-    for (let i = 0; i < N; i++) flf[i] = keep[L32[i]];
-    const flb = gaussF(flf, w, h, 0.7 * f);
-    const __d34 = bh.data;
-    for (let i = 0; i < N; i++) struct[i] = Math.max(struct[i], flb[i] * clamp01((__d34[i] - 10) / 25) * fp);
-    g1.delete(); bh.delete(); kb.delete(); zone.delete(); kz.delete(); fl.delete(); labels.delete(); stats.delete(); cents.delete();
+    // ถ้าเจอตา ใช้เฉพาะรอบตา/คิ้ว (แว่น เปลือกตา) กันรอยย่นบนแก้ม; ไม่เจอ (หน้าด้านข้าง) ใช้ทั้งหน้า
+    let zone;
+    if (st.hasRegions && mx(R.eye) > 0.3) {
+      const eb = new Uint8Array(N);
+      for (let i = 0; i < N; i++) eb[i] = R.eye[i] + R.brow[i] > 0.3 ? 1 : 0;
+      zone = morphU8(eb, w, h, 'dilate', odd(31 * f));
+    } else zone = morphU8(faceH, w, h, 'dilate', odd(41 * f));
+    const bb = bboxOf(zone, w, h, 0, Math.round(8 * f));
+    if (bb) {
+      const { x0, y0, rw, rh } = bb, M = rw * rh;
+      const g1 = subU8(st.g0, w, bb), bh = new cv.Mat(), kb = ellipse(odd(11 * f));
+      cv.GaussianBlur(g1, g1, new cv.Size(0, 0), 0.8 * f, 0.8 * f);
+      cv.morphologyEx(g1, bh, cv.MORPH_BLACKHAT, kb);
+      const BH = bh.data, fl = new cv.Mat(rh, rw, cv.CV_8U), FL = fl.data;
+      for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+        const i = (y0 + y) * w + x0 + x, j = y * rw + x;
+        FL[j] = BH[j] > 16 && zone[i] && mbA[i] && hair[i] < 0.6 && mouth[i] < 0.3 ? 1 : 0;
+      }
+      const labels = new cv.Mat(), stats = new cv.Mat(), cents = new cv.Mat();
+      const nc = cv.connectedComponentsWithStats(fl, labels, stats, cents, 8, cv.CV_32S);
+      const A = stats.data32S, keep = new Uint8Array(nc);
+      for (let c = 1; c < nc; c++) keep[c] = Math.max(A[c * 5 + 2], A[c * 5 + 3]) >= 12 * f && A[c * 5 + 4] >= 10 * f * f ? 1 : 0;
+      const L32 = labels.data32S, flf = new Float32Array(M);
+      for (let j = 0; j < M; j++) flf[j] = keep[L32[j]];
+      const flb = gaussF(flf, rw, rh, 0.7 * f);
+      for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+        const i = (y0 + y) * w + x0 + x, j = y * rw + x, v2 = flb[j] * clamp01((BH[j] - 10) / 25);
+        if (v2 > lf[i]) lf[i] = v2;
+      }
+      g1.delete(); bh.delete(); kb.delete(); fl.delete(); labels.delete(); stats.delete(); cents.delete();
+    }
   }
+  for (let i = 0; i < N; i++) lf[i] *= 0.9 * fp;
 
-  // C. fine detail: Canny ละเอียด แต่ถูกกดไว้เกือบหมด
-  let fine = null;
-  if (p.fineSuppress < 1) {
-    const e = new cv.Mat();
-    cv.Canny(Su, e, 0.6 * med, 1.2 * med);
-    const sd = newF32(w, h, struct), sdd = new cv.Mat(), k5 = cv.Mat.ones(5, 5, cv.CV_8U);
-    cv.dilate(sd, sdd, k5);
-    const fr = new Float32Array(N);
-    const __d35 = mb.data;
-    const __d36 = e.data;
-    const __d37 = sdd.data32F;
-    for (let i = 0; i < N; i++) fr[i] = (__d36[i] / 255) * (1 - Math.min(1, __d37[i])) * __d35[i] * (1 - skin[i]);
-    fine = gaussF(fr, w, h, 0.6 * f);
-    const fA = (1 - p.fineSuppress) * 0.6;
-    for (let i = 0; i < N; i++) fine[i] *= fA;
-    e.delete(); sd.delete(); sdd.delete(); k5.delete();
+  // ขอบก้อนโทนของผม (ปานกลาง)
+  const hl = new Float32Array(N);
+  if (hasHair) {
+    const ht = new Float32Array(N);
+    for (let i = 0; i < N; i++) ht[i] = tone[i] * hairH[i];
+    const hb = newF32(w, h, gaussF(ht, w, h, 0.8 * f)), gx = new cv.Mat(), gy = new cv.Mat();
+    cv.Sobel(hb, gx, cv.CV_32F, 1, 0); cv.Sobel(hb, gy, cv.CV_32F, 0, 1);
+    const he = morphU8(hairH, w, h, 'erode', odd(5 * f)), GX = gx.data32F, GY = gy.data32F;
+    const hk = 0.5 * p.structural * (0.4 + 0.6 * p.hairDetail);
+    for (let i = 0; i < N; i++) hl[i] = clamp01(Math.sqrt(GX[i] * GX[i] + GY[i] * GY[i]) * he[i] / (rng * 0.6)) * hk;
+    hb.delete(); gx.delete(); gy.delete();
   }
-  Su.delete(); mb.delete();
+  // รอยพับผ้า: เส้น Canny ยาว ๆ บนภาพที่เกลี่ยแล้ว (ปานกลาง-ต่ำ)
+  const cl = new Float32Array(N);
+  {
+    const Su = u8Mat(w, h, gaussF(Sf, w, h, 1.5 * f));
+    const hw = Math.max(1, w >> 1), hh = Math.max(1, h >> 1);
+    const half = new cv.Mat(), ed = new cv.Mat();
+    cv.resize(Su, half, new cv.Size(hw, hh), 0, 0, cv.INTER_AREA);
+    const hh2 = new Array(256).fill(0), HD = half.data;
+    for (let i = 0; i < HD.length; i++) hh2[HD[i]]++;
+    const med = percentileFromHist(hh2, HD.length, 0.5);
+    cv.Canny(half, ed, 0.66 * med, 1.33 * med);
+    const cs = new cv.MatVector(), hi2 = new cv.Mat();
+    cv.findContours(ed, cs, hi2, cv.RETR_LIST, cv.CHAIN_APPROX_NONE);
+    const ce = morphU8(clothH, w, h, 'erode', odd(5 * f));
+    const minLen = 60 * f * (1 + 2 * p.fineSuppress);
+    const keep = new cv.MatVector();
+    for (let c = 0; c < cs.size(); c++) {
+      const cnt = cs.get(c), d = cnt.data32S, mid = (d.length >> 2) << 1;
+      const x = Math.min(w - 1, d[mid] * 2), y = Math.min(h - 1, d[mid + 1] * 2);
+      if (ce[y * w + x] && cv.arcLength(cnt, false) * 2 >= minLen) {
+        const ap = new cv.Mat(); cv.approxPolyDP(cnt, ap, 0.8, false); keep.push_back(ap); ap.delete();
+      }
+      cnt.delete();
+    }
+    const cimg = cv.Mat.zeros(hh, hw, cv.CV_8U);
+    if (keep.size()) cv.polylines(cimg, keep, false, new cv.Scalar(255), 1, cv.LINE_AA);
+    const cf = new Float32Array(hw * hh), CD = cimg.data;
+    for (let i = 0; i < CD.length; i++) cf[i] = CD[i] / 255;
+    const cu = gaussF(resizeF(cf, hw, hh, w, h), w, h, 0.5 * f), ck = 0.45 * p.structural;
+    for (let i = 0; i < N; i++) cl[i] = cu[i] * ck;
+    Su.delete(); half.delete(); ed.delete(); cs.delete(); hi2.delete(); keep.delete(); cimg.delete();
+  }
 
   const blo = p.black * 0.5;
   for (let i = 0; i < N; i++) {
-    let ln = Math.max(sil[i], struct[i]);
-    if (fine) ln = Math.max(ln, fine[i]);
-    ln = clamp01(ln) * 0.85;
+    const ln = clamp01(Math.max(sil[i], lf[i], hl[i], cl[i])) * 0.85;
     const tv = tone[i] * (1 - ln) + blo * ln;
     tone[i] = tv < blo ? blo : tv > p.white ? p.white : tv;
   }
