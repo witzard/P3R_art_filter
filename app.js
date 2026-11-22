@@ -7,21 +7,44 @@ const MAX_FILE_MB = 30;
 const MAX_PIXELS = 50e6;
 const UNDO_LIMIT = 30;
 
-// [key, label, min, max, step, default]
-const PARAMS = [
-  ['smooth',    'Skin smoothing',            0,   1,   0.01, 0.45],
-  ['levels',    'Shadow levels',             2,   10,  1,    5],
-  ['posterize', 'Posterize strength',        0,   1,   0.01, 0.55],
-  ['detail',    'Hair/fabric detail',        0,   2,   0.05, 0.9],
-  ['ink',       'Ink lines',                 0,   1,   0.01, 0.35],
-  ['tint',      'Blue tint in shadows',      0,   0.5, 0.01, 0.12],
-  ['black',     'Black point',               0,   80,  1,    22],
-  ['white',     'White point',               180, 255, 1,    238],
-  ['gamma',     'Gamma (>1 = darker)',       0.5, 2,   0.05, 1.0],
-  ['shards',    'Glass shards',              0,   80,  1,    25],
-  ['band',      'Edge cleanup (px)',         0,   60,  1,    30],
-  ['protect',   'Protect nose/solid parts (px)', 0,   20,  1,    7],
-];
+// กลุ่มของ slider: [key, label, min, max, step, default]
+const GROUPS = {
+  g_cartoon: [
+    ['cartoon',             'Simplification',            0,   1,   0.05, 0.6],
+  ],
+  g_hair: [
+    ['hairCleanup',         'Hair cleanup',              0,   1,   0.05, 0.6],
+    ['hairDetail',          'Hair strand detail',        0,   1,   0.05, 0.3],
+  ],
+  g_face: [
+    ['facialSmoothing',     'Facial smoothing',          0,   1,   0.05, 0.7],
+    ['featurePreservation', 'Feature preservation',      0,   1,   0.05, 0.7],
+  ],
+  g_shading: [
+    ['levels',              'Shadow levels',             2,   5,   1,    4],
+    ['shadowMerge',         'Shadow merge',              0,   1,   0.05, 0.5],
+    ['shadingHardness',     'Shading hardness',          0,   1,   0.05, 0.75],
+    ['smallRegion',         'Small region suppression',  0,   1,   0.05, 0.5],
+    ['gamma',               'Gamma (>1 = darker)',       0.5, 2,   0.05, 1.0],
+    ['black',               'Black point',               0,   80,  1,    22],
+    ['white',               'White point',               180, 255, 1,    238],
+  ],
+  g_lines: [
+    ['silhouette',          'Silhouette lines',          0,   2,   0.05, 1.0],
+    ['structural',          'Structural lines',          0,   1,   0.05, 0.5],
+    ['fineSuppress',        'Fine detail suppression',   0,   1,   0.05, 0.85],
+  ],
+  g_color: [
+    ['tint',                'Blue tint strength',        0,   1,   0.05, 0.15],
+    ['detail',              'Texture detail',            0,   2,   0.05, 0.6],
+    ['shards',              'Glass shards',              0,   80,  1,    25],
+  ],
+  g_cutout: [
+    ['band',                'Edge cleanup (px)',         0,   60,  1,    30],
+    ['protect',             'Protect nose/solid parts (px)', 0, 20, 1,   7],
+  ],
+};
+const PARAMS = Object.values(GROUPS).flat();
 const BRUSH_PARAMS = [
   ['brush', 'Brush size (px)', 4, 200, 2, 40],
   ['zoom',  'Zoom (%)',      100, 400, 25, 100],
@@ -133,7 +156,8 @@ function makeSlider(box, [key, label, min, max, step, def], onChange) {
   row.className = 'row';
   const lab = document.createElement('label');
   const name = document.createElement('span'); name.textContent = label;
-  const val = document.createElement('span'); val.id = 'v_' + key; val.textContent = def;
+  const decimals = (String(step).split('.')[1] || '').length;
+  const val = document.createElement('span'); val.id = 'v_' + key; val.textContent = Number(def).toFixed(decimals);
   lab.append(name, val);
 
   const ctl = document.createElement('div');
@@ -146,7 +170,6 @@ function makeSlider(box, [key, label, min, max, step, def], onChange) {
   row.append(lab, ctl);
   box.appendChild(row);
 
-  const decimals = (String(step).split('.')[1] || '').length;
   const update = () => { val.textContent = Number(input.value).toFixed(decimals); onChange(); };
   input.addEventListener('input', update);
 
@@ -172,6 +195,7 @@ function getParams() {
   const p = {};
   for (const [key] of PARAMS) p[key] = parseFloat($('p_' + key).value);
   p.bg = $('bg').value;
+  p.colorMode = $('colorMode').value;
   return p;
 }
 
@@ -181,6 +205,7 @@ function resetParams() {
     $('v_' + key).textContent = Number(def).toFixed((String(step).split('.')[1] || '').length);
   }
   $('bg').value = '#12acf4';
+  $('colorMode').value = 'gray';
   scheduleRender();
 }
 
@@ -347,7 +372,14 @@ async function download() {
 
 // ------------------------------------------------------------ เริ่มต้น
 async function init() {
-  for (const p of PARAMS) makeSlider($('sliders'), p, () => scheduleRender());
+  for (const [box, list] of Object.entries(GROUPS))
+    for (const p of list) makeSlider($(box), p, () => scheduleRender());
+  $('colorMode').addEventListener('change', () => {
+    // โหมดฟ้าใช้ palette เต็มที่ โหมดเทาใช้ฟ้าจาง ๆ
+    const t = $('colorMode').value === 'blue' ? 0.85 : 0.15;
+    $('p_tint').value = t; $('v_tint').textContent = t.toFixed(2);
+    scheduleRender();
+  });
   makeSlider($('brushSliders'), BRUSH_PARAMS[0], () => {});
   makeSlider($('brushSliders'), BRUSH_PARAMS[1], () => {
     $('stage').style.width = $('p_zoom').value + '%';

@@ -9,7 +9,7 @@
   body { font-family: system-ui, sans-serif; margin: 16px; max-width: 1200px; }
   .wrap { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
   .panel { flex: 0 0 320px; }
-  .view { flex: 1 1 400px; min-width: 0; }
+  .view { flex: 1 1 400px; min-width: 0; position: sticky; top: 8px; }
   fieldset { margin: 0 0 12px; padding: 8px 10px; }
   legend { font-weight: 600; }
   .row { margin-bottom: 8px; }
@@ -40,9 +40,22 @@
 
 <div class="wrap">
   <div class="panel">
+    <fieldset><legend>Cartoon Simplification</legend><div id="g_cartoon"></div></fieldset>
+    <fieldset><legend>Hair</legend><div id="g_hair"></div></fieldset>
+    <fieldset><legend>Face</legend><div id="g_face"></div></fieldset>
+    <fieldset><legend>Shading</legend><div id="g_shading"></div></fieldset>
+    <fieldset><legend>Line Art</legend><div id="g_lines"></div></fieldset>
     <fieldset>
-      <legend>Adjust image</legend>
-      <div id="sliders"></div>
+      <legend>Color</legend>
+      <div class="row">
+        <label>Color mode
+          <select id="colorMode">
+            <option value="gray">Grayscale</option>
+            <option value="blue">P3R blue palette</option>
+          </select>
+        </label>
+      </div>
+      <div id="g_color"></div>
       <div class="row">
         <label>Background color <input type="color" id="bg" value="#12acf4"></label>
       </div>
@@ -57,6 +70,7 @@
         <label><input type="radio" name="mode" value="add"> Paint to keep</label>
         <label><input type="radio" name="mode" value="erase"> Paint to remove</label>
       </div>
+      <div id="g_cutout"></div>
       <div id="brushSliders"></div>
       <label style="font-size:14px"><input type="checkbox" id="showMask"> Show removed areas (red)</label><br>
       <button id="undo" disabled>Undo</button>

@@ -14,9 +14,22 @@
 | `app.js` | หน้าเว็บ: slider (+/−), แปรงระบายเพิ่ม/ลบพื้นหลัง, undo, ซูม, คุยกับ worker |
 | `worker.js` | ประมวลผลทั้งหมดใน Web Worker (ตัดพื้นหลัง + ฟิลเตอร์) หน้าเว็บจึงไม่ค้าง |
 | `models/silueta.onnx` | โมเดลตัดพื้นหลัง (~43 MB) |
+| `models/face_parsing_resnet18.onnx` | โมเดลแยกผม/ผิว/ตา/คิ้ว/ปาก (BiSeNet, ~53 MB) จาก [yakhyo/face-parsing](https://github.com/yakhyo/face-parsing) เทรนบน CelebAMask-HQ ซึ่งอนุญาตเฉพาะงานที่ไม่ใช่เชิงพาณิชย์ |
 | `vendor/` | onnxruntime-web 1.31.1 (MIT) และ OpenCV.js 5.0 (Apache-2.0) เก็บไว้ใน repo เอง |
 | `vercel.json` | security headers (CSP ฯลฯ) และ cache |
-| `python/p3r_filter.py` | เวอร์ชัน Python (CLI) ของฟิลเตอร์เดียวกัน |
+| `python/p3r_filter.py` | เวอร์ชัน Python (CLI) รุ่นเก่า (ยังไม่มี cartoon pipeline) |
+
+## Pipeline (worker.js)
+
+1. ตัดพื้นหลัง (U2-Net silueta) + edge cleanup (Lab, distance transform, connected components) + แปรงแก้ mask
+2. หาหัวจาก silhouette (จุดที่คอแคบลง) แล้วรัน face parsing บนภาพหัว → แผนที่ผม/ผิว/ตา-คิ้ว-ปาก/ช่องปาก ถ้าไม่เจอหน้าจะไม่ใช้การแยกบริเวณ (fallback)
+3. Cartoon simplification: bilateral หลายรอบ + median
+4. ผม: median + closing/opening รวมเส้นเป็นก้อน, ไฮไลต์ถูกกดเป็นโทนกลาง
+5. หน้า: bilateral เพิ่มบนผิวยกเว้นตา/คิ้ว/ปาก, ฟัน: closing เฉพาะในช่องปากเพื่อลบร่องระหว่างฟัน
+6. Cel shading แยกตามบริเวณ (quantize → median merge → ลบ region เล็กตามสัดส่วนพื้นที่ภาพ → palette), เงาผิวไม่ต่ำกว่าเทากลาง
+7. คืนรายละเอียดเฉพาะบริเวณ (ผิว ~0, ผ้าปานกลาง, ผมเฉพาะโครงหยาบ)
+8. เส้น 3 ระดับ: silhouette (ขอบตัว + ขอบผมกับหน้า), structural (Canny ครึ่งความละเอียด + กรองความยาวตามบริเวณ + black-hat สำหรับแว่น/เปลือกตา), fine detail (ถูกกด)
+9. สี: Grayscale หรือ P3R blue palette (navy → royal → cyan → cool white ตามความสว่าง, ผิวซีดกว่า)
 
 ## ความปลอดภัย
 
