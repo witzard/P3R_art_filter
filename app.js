@@ -24,6 +24,8 @@ const GROUPS = {
     ['levels',              'Shadow levels',             2,   5,   1,    4],
     ['shadowMerge',         'Shadow merge',              0,   1,   0.05, 0.5],
     ['shadingHardness',     'Shading hardness',          0,   1,   0.05, 0.75],
+    ['edgeSmooth',          'Shadow edge smoothness',    0,   1,   0.05, 0.5],
+    ['geometric',           'Geometric shadows',         0,   1,   0.05, 0],
     ['smallRegion',         'Small region suppression',  0,   1,   0.05, 0.5],
     ['gamma',               'Gamma (>1 = darker)',       0.5, 2,   0.05, 1.0],
     ['black',               'Black point',               0,   80,  1,    22],
@@ -45,6 +47,47 @@ const GROUPS = {
   ],
 };
 const PARAMS = Object.values(GROUPS).flat();
+
+// Presets: ค่าที่ไม่ได้ระบุจะใช้ค่าเริ่มต้น
+const PRESETS = {
+  balanced: { label: 'Balanced (recommended)', colorMode: 'gray', values: {
+    cartoon: 0.5, hairCleanup: 0.5, hairDetail: 0.4, facialSmoothing: 0.65, featurePreservation: 0.7,
+    levels: 4, shadowMerge: 0.5, shadingHardness: 0.7, smallRegion: 0.5, edgeSmooth: 0.5, geometric: 0,
+    gamma: 1.1, black: 18, white: 235, silhouette: 0.6, structural: 0.4, fineSuppress: 0.85,
+    tint: 0.15, detail: 0.7, shards: 30 } },
+  clean: { label: 'Clean anime', colorMode: 'gray', values: {
+    cartoon: 0.8, hairCleanup: 0.8, hairDetail: 0.2, facialSmoothing: 0.85, featurePreservation: 0.8,
+    levels: 3, shadowMerge: 0.7, shadingHardness: 0.85, smallRegion: 0.8, edgeSmooth: 0.7, geometric: 0,
+    gamma: 1.0, black: 20, white: 238, silhouette: 1.0, structural: 0.3, fineSuppress: 0.95,
+    tint: 0.15, detail: 0.3, shards: 25 } },
+  graphic: { label: 'Graphic poster', colorMode: 'gray', values: {
+    cartoon: 0, hairCleanup: 0, hairDetail: 0.85, facialSmoothing: 0.6, featurePreservation: 0,
+    levels: 5, shadowMerge: 0.55, shadingHardness: 0.45, smallRegion: 0, edgeSmooth: 0.3, geometric: 0,
+    gamma: 1.25, black: 13, white: 228, silhouette: 0, structural: 0.15, fineSuppress: 0.7,
+    tint: 0.25, detail: 1.25, shards: 80 } },
+  geometric: { label: 'Geometric', colorMode: 'gray', values: {
+    cartoon: 0.6, hairCleanup: 0.6, hairDetail: 0.3, facialSmoothing: 0.7, featurePreservation: 0.7,
+    levels: 4, shadowMerge: 0.6, shadingHardness: 0.95, smallRegion: 0.7, edgeSmooth: 0.4, geometric: 0.7,
+    gamma: 1.1, black: 16, white: 236, silhouette: 0.8, structural: 0.25, fineSuppress: 0.9,
+    tint: 0.15, detail: 0.3, shards: 40 } },
+  blue: { label: 'P3R blue', colorMode: 'blue', values: {
+    cartoon: 0.6, hairCleanup: 0.6, hairDetail: 0.3, facialSmoothing: 0.7, featurePreservation: 0.7,
+    levels: 4, shadowMerge: 0.55, shadingHardness: 0.8, smallRegion: 0.6, edgeSmooth: 0.5, geometric: 0.25,
+    gamma: 1.05, black: 18, white: 238, silhouette: 0.7, structural: 0.35, fineSuppress: 0.9,
+    tint: 0.85, detail: 0.5, shards: 35 } },
+};
+
+function applyPreset(name) {
+  const pr = PRESETS[name];
+  for (const [key, , , , step, def] of PARAMS) {
+    const v = pr.values[key] ?? def;
+    $('p_' + key).value = v;
+    $('v_' + key).textContent = Number(v).toFixed((String(step).split('.')[1] || '').length);
+  }
+  $('colorMode').value = pr.colorMode;
+  for (const b of document.querySelectorAll('#presets button')) b.classList.toggle('active', b.dataset.preset === name);
+  scheduleRender();
+}
 const BRUSH_PARAMS = [
   ['brush', 'Brush size (px)', 4, 200, 2, 40],
   ['zoom',  'Zoom (%)',      100, 400, 25, 100],
@@ -374,6 +417,12 @@ async function download() {
 async function init() {
   for (const [box, list] of Object.entries(GROUPS))
     for (const p of list) makeSlider($(box), p, () => scheduleRender());
+  for (const [name, pr] of Object.entries(PRESETS)) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = pr.label; b.dataset.preset = name;
+    b.onclick = () => applyPreset(name);
+    $('presets').appendChild(b);
+  }
   $('colorMode').addEventListener('change', () => {
     // โหมดฟ้าใช้ palette เต็มที่ โหมดเทาใช้ฟ้าจาง ๆ
     const t = $('colorMode').value === 'blue' ? 0.85 : 0.15;

@@ -28,6 +28,7 @@
   #strokes.painting { pointer-events: auto; touch-action: none; cursor: crosshair; }
   .modes label { display: inline-block; margin-right: 10px; font-size: 14px; }
   .hint { font-size: 12px; color: #666; }
+  #presets button.active { font-weight: 600; outline: 2px solid #12acf4; }
 </style>
 </head>
 <body>
@@ -40,6 +41,7 @@
 
 <div class="wrap">
   <div class="panel">
+    <fieldset><legend>Presets</legend><div id="presets"></div></fieldset>
     <fieldset><legend>Cartoon Simplification</legend><div id="g_cartoon"></div></fieldset>
     <fieldset><legend>Hair</legend><div id="g_hair"></div></fieldset>
     <fieldset><legend>Face</legend><div id="g_face"></div></fieldset>

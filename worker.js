@@ -571,10 +571,31 @@ function percentileOf(vals, mask, q) {
   return 1;
 }
 
+// เปลี่ยน mask เป็นรูปหลายเหลี่ยม (เงาแบบเรขาคณิต): approxPolyDP แต่ละ contour แล้วเติมใหม่ (รองรับรู)
+function polygonize(M, w, h, geo, f) {
+  const m = new cv.Mat(h, w, cv.CV_8U); m.data.set(M);
+  const cs = new cv.MatVector(), hi = new cv.Mat();
+  cv.findContours(m, cs, hi, cv.RETR_CCOMP, cv.CHAIN_APPROX_NONE);
+  const ap = new cv.MatVector();
+  for (let c = 0; c < cs.size(); c++) {
+    const cnt = cs.get(c), a = new cv.Mat();
+    // ชิ้นใหญ่ได้เหลี่ยมใหญ่ ชิ้นเล็กเหลี่ยมเล็ก
+    const eps = Math.min(14 * f, geo * (0.8 * f + 0.02 * cv.arcLength(cnt, true)));
+    cv.approxPolyDP(cnt, a, Math.max(0.5, eps), true);
+    ap.push_back(a); a.delete(); cnt.delete();
+  }
+  const out = cv.Mat.zeros(h, w, cv.CV_8U);
+  if (ap.size()) cv.drawContours(out, ap, -1, new cv.Scalar(1), -1, cv.LINE_8, hi, 2);
+  const res = out.data.slice();
+  m.delete(); cs.delete(); hi.delete(); ap.delete(); out.delete();
+  return res;
+}
+
 // โทนของบริเวณหนึ่งด้วย "nested tone masks": M_k = v >= t_k (ภายใน region)
 // แต่ละ mask: closing/opening -> ลบเกาะและรูเล็ก (ตามสัดส่วนพื้นที่ภาพ) -> blur+threshold ให้ขอบเรียบ
 // บังคับซ้อนกัน (M_k+1 อยู่ใน M_k) ทำที่ครึ่งความละเอียดแล้วขยายกลับ
-function toneRegion(st, vv, region, th, pal, rClose, rOpen, minArea, sigma, hard) {
+function toneRegion(st, vv, region, th, pal, rClose, rOpen, minArea, sigma, hard, opt = {}) {
+  const smoothMul = opt.smooth == null ? 1 : opt.smooth, geo = opt.geo || 0;
   const W = st.w, H = st.h, w = Math.max(1, W >> 1), h = Math.max(1, H >> 1), N = w * h;
   const vm = newF32(W, H, vv), vs = new cv.Mat();
   cv.resize(vm, vs, new cv.Size(w, h), 0, 0, cv.INTER_AREA);
@@ -596,7 +617,12 @@ function toneRegion(st, vv, region, th, pal, rClose, rOpen, minArea, sigma, hard
     for (let i = 0; i < N; i++) M[i] &= R[i];
     removeSmall(M, R, w, h, ma, 1);
     removeSmall(M, R, w, h, ma, 0);
-    const A = gaussF(Float32Array.from(M), w, h, sg);
+    let A = gaussF(Float32Array.from(M), w, h, Math.max(0.4, sg * smoothMul));
+    if (geo > 0) {   // เงาเหลี่ยม: ทำขอบเรียบก่อน แล้วแปลงเป็นรูปหลายเหลี่ยม เบลอนิดเดียวเพื่อ anti-alias มุมยังคม
+      const Mb = new Uint8Array(N);
+      for (let i = 0; i < N; i++) Mb[i] = A[i] > 0.5 && R[i] ? 1 : 0;
+      A = gaussF(Float32Array.from(polygonize(Mb, w, h, geo, st.f / 2)), w, h, 0.5);
+    }
     const alpha = new Float32Array(N), next = new Uint8Array(N), dp = pal[k + 1] - pal[k];
     for (let i = 0; i < N; i++) {
       let a = clamp01((A[i] - 0.5) * ramp + 0.5);
@@ -721,6 +747,8 @@ function renderPerson(st, p) {
 
   // 5. โทนแบบ nested masks แยกตามบริเวณ (ไม่รวมข้ามขอบ ผม / หน้า / เสื้อผ้า)
   const L = p.levels, hard = p.shadingHardness, rng = p.white - p.black;
+  // Edge smoothness 0..1 -> ตัวคูณความเรียบของขอบเงา; Geometric 0..1 -> ขนาดเหลี่ยมของเงา
+  const edgeOpt = { smooth: 0.25 + 1.75 * (p.edgeSmooth ?? 0.5), geo: p.geometric || 0 };
   const merge = p.shadowMerge, sup = p.smallRegion;
   const palOf = (cnt, a = 0, b = 1) => Array.from({ length: cnt }, (_, i) =>
     p.black + rng * (a + (b - a) * Math.pow(i / Math.max(cnt - 1, 1), 0.9)));
@@ -772,7 +800,7 @@ function renderPerson(st, p) {
   }
   // ขอบโทนของเสื้อผ้าเรียบน้อยกว่าผม/ผิว (เก็บมุม)
   let tone = toneRegion(st, vc, clothX, Array.from({ length: L - 1 }, (_, k) => (k + 1) / L), palOf(L),
-    (1 + 3 * merge) * f, (1 + 2 * merge) * f, sup * 0.0015 * N, (0.8 + 1.2 * merge) * f, hard);
+    (1 + 3 * merge) * f, (1 + 2 * merge) * f, sup * 0.0015 * N, (0.8 + 1.2 * merge) * f, hard, edgeOpt);
   // ผม: เกณฑ์จากความสว่างของผมเอง, สว่างสุดแค่โทนกลาง-สว่าง, รวมก้อนใหญ่
   if (hasHair) {
     // ขอบนอกของผม (mask มีแต่ความน่าจะเป็นผม < 0.5) ใช้ palette ของผมด้วย กันขอบสว่างแปลก ๆ
@@ -785,7 +813,7 @@ function renderPerson(st, p) {
     const th = qs.map((q) => percentileOf(vh, hairH, q));
     // merge แบบรอบทิศเล็กลง: การรวมหลักทำตามทิศเส้นผมแล้ว
     over(toneRegion(st, vh, morphU8(hairX, w, h, 'dilate', k4), th, palOf(nl, 0, 0.62),
-      (1 + 3 * hc) * f, (1.5 + 3 * hc) * f, (0.0015 + 0.005 * hc) * sup * N, (1.5 + 2 * hc) * f, hard), hairX);
+      (1 + 3 * hc) * f, (1.5 + 3 * hc) * f, (0.0015 + 0.005 * hc) * sup * N, (1.5 + 2 * hc) * f, hard, edgeOpt), hairX);
   }
   // หน้า: normalize ความสว่างผิว, ไม่เกิน 3 ระดับ, เงาไม่ต่ำกว่าเทากลาง, ลบเงาเล็ก ๆ บนแก้ม
   if (hasSkin) {
@@ -795,7 +823,7 @@ function renderPerson(st, p) {
     for (let i = 0; i < N; i++) vs[i] = clamp01((vs[i] - a5) / Math.max(a95 - a5, 1e-3));
     const nl = Math.min(L, 3);
     over(toneRegion(st, vs, morphU8(faceH, w, h, 'dilate', k4), nl === 3 ? [0.22, 0.5] : [0.3], palOf(nl, 0.45, 1),
-      (3 + 6 * fs) * f, (2 + 5 * fs) * f, (0.002 + 0.006 * fs) * sup * N + 1, (2 + 3 * fs) * f, hard), faceH);
+      (3 + 6 * fs) * f, (2 + 5 * fs) * f, (0.002 + 0.006 * fs) * sup * N + 1, (2 + 3 * fs) * f, hard, edgeOpt), faceH);
   }
   // คิ้ว: ก้อนเข้มก้อนเดียว / ปาก: โทนเรียบ / ฟัน: ก้อนสว่างก้อนเดียวในช่องปากสีเข้ม
   if (st.hasRegions) {
