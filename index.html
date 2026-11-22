@@ -4,17 +4,30 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>P3R Art Filter</title>
+<link rel="icon" href="data:,">
 <style>
-  body { font-family: system-ui, sans-serif; margin: 16px; max-width: 1100px; }
+  body { font-family: system-ui, sans-serif; margin: 16px; max-width: 1200px; }
   .wrap { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
-  .panel { flex: 0 0 300px; }
+  .panel { flex: 0 0 320px; }
   .view { flex: 1 1 400px; min-width: 0; }
-  .row { margin-bottom: 10px; }
+  fieldset { margin: 0 0 12px; padding: 8px 10px; }
+  legend { font-weight: 600; }
+  .row { margin-bottom: 8px; }
   .row label { display: flex; justify-content: space-between; font-size: 14px; }
-  .row input[type=range] { width: 100%; }
-  canvas { max-width: 100%; height: auto; border: 1px solid #ccc; display: block; }
+  .ctl { display: flex; align-items: center; gap: 4px; }
+  .ctl input[type=range] { flex: 1; min-width: 0; }
+  .ctl button { width: 32px; height: 28px; padding: 0; margin: 0; font-size: 16px; }
   button { margin: 4px 4px 4px 0; padding: 6px 10px; }
   #status { color: #555; font-size: 14px; margin: 8px 0; }
+  #scroller { overflow: auto; max-height: 80vh; border: 1px solid #ccc; }
+  #stage { position: relative; }
+  #out { display: block; width: 100%; height: auto; }
+  #maskOverlay, #strokes { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #maskOverlay { pointer-events: none; }
+  #strokes { pointer-events: none; }
+  #strokes.painting { pointer-events: auto; touch-action: none; cursor: crosshair; }
+  .modes label { display: inline-block; margin-right: 10px; font-size: 14px; }
+  .hint { font-size: 12px; color: #666; }
 </style>
 </head>
 <body>
@@ -27,24 +40,45 @@
 
 <div class="wrap">
   <div class="panel">
-    <div id="sliders"></div>
-    <div class="row">
-      <label>สีพื้นหลัง <input type="color" id="bg" value="#12acf4"></label>
-    </div>
-    <button id="reseed">สุ่มเศษกระจกใหม่</button>
-    <button id="reset">ค่าเริ่มต้น</button><br>
+    <fieldset>
+      <legend>ปรับภาพ</legend>
+      <div id="sliders"></div>
+      <div class="row">
+        <label>สีพื้นหลัง <input type="color" id="bg" value="#12acf4"></label>
+      </div>
+      <button id="reseed">สุ่มเศษกระจกใหม่</button>
+      <button id="reset">ค่าเริ่มต้น</button>
+    </fieldset>
+
+    <fieldset>
+      <legend>แก้การตัดพื้นหลัง</legend>
+      <div class="modes row">
+        <label><input type="radio" name="mode" value="view" checked> เลื่อน/ดู</label>
+        <label><input type="radio" name="mode" value="add"> ระบายเพิ่ม</label>
+        <label><input type="radio" name="mode" value="erase"> ระบายลบ</label>
+      </div>
+      <div id="brushSliders"></div>
+      <label style="font-size:14px"><input type="checkbox" id="showMask"> แสดงพื้นที่ที่ถูกตัด (สีแดง)</label><br>
+      <button id="undo" disabled>ย้อนกลับ</button>
+      <button id="clearEdits" disabled>ล้างที่ระบาย</button>
+      <div class="hint">ระบายเพิ่ม = เอาส่วนที่ AI ตัดเกินกลับมา, ระบายลบ = ลบพื้นหลังที่ AI ตัดไม่หมด</div>
+    </fieldset>
+
     <label style="font-size:14px"><input type="checkbox" id="showOrig"> ดูภาพต้นฉบับ</label><br>
-    <button id="download" disabled>ดาวน์โหลด PNG</button>
+    <button id="download" disabled>ดาวน์โหลด PNG (ความละเอียดเต็ม)</button>
   </div>
+
   <div class="view">
-    <canvas id="out" width="10" height="10"></canvas>
+    <div id="scroller">
+      <div id="stage">
+        <canvas id="out" width="10" height="10"></canvas>
+        <canvas id="maskOverlay" width="10" height="10"></canvas>
+        <canvas id="strokes" width="10" height="10"></canvas>
+      </div>
+    </div>
   </div>
 </div>
 
-<!-- ไลบรารีเก็บไว้ใน repo เอง (ไม่โหลดโค้ดจากเว็บอื่น) -->
-<!-- onnxruntime-web 1.31.1, @techstark/opencv-js 5.0.0-release.1 -->
-<script src="vendor/ort.wasm.min.js"></script>
-<script src="vendor/opencv.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

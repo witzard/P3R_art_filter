@@ -1,12 +1,11 @@
-// P3R Art Filter: ทำงานในเบราว์เซอร์ทั้งหมด
-// - ตัดพื้นหลัง: โมเดล silueta (U2-Net) ผ่าน onnxruntime-web
-// - ฟิลเตอร์: OpenCV.js (พอร์ตจาก python/p3r_filter.py)
+// P3R Art Filter: ส่วนหน้าเว็บ (UI, แปรงระบาย, คุยกับ worker)
+// การประมวลผลภาพทั้งหมดอยู่ใน worker.js หน้าเว็บจึงไม่ค้างระหว่างประมวลผล
 
-const MODEL_URL = 'models/silueta.onnx';
-const ORT_WASM = new URL('vendor/', location.href).href;
-const MAX_FILE_MB = 30;          // กันไฟล์ใหญ่ผิดปกติ
-const MAX_PIXELS = 50e6;         // กันภาพที่ขยายแล้วกินแรมมหาศาล (decompression bomb)
-const MAX_SIZE = 1400; // ย่อภาพด้านยาวสุดเหลือเท่านี้ ให้ปรับ slider ได้ลื่น
+const PREVIEW_MAX = 1000;  // พรีวิวขณะปรับค่า (เร็ว)
+const EXPORT_MAX = 2000;   // ภาพที่ดาวน์โหลด (ความละเอียดเต็ม)
+const MAX_FILE_MB = 30;
+const MAX_PIXELS = 50e6;
+const UNDO_LIMIT = 30;
 
 // [key, label, min, max, step, default]
 const PARAMS = [
@@ -23,32 +22,149 @@ const PARAMS = [
   ['band',      'ลบพื้นหลังเดิมที่ขอบ (px)',    0,   60,  1,    30],
   ['protect',   'ปกป้องจมูก/ส่วนหนา (px)',     0,   20,  1,    7],
 ];
+const BRUSH_PARAMS = [
+  ['brush', 'ขนาดแปรง (px)', 4, 200, 2, 40],
+  ['zoom',  'ซูม (%)',       100, 400, 25, 100],
+];
 
 const $ = (id) => document.getElementById(id);
-let cv = null;
-let session = null;
-let state = null;   // ข้อมูลของภาพที่อัปโหลด (คำนวณครั้งเดียว)
-let seed = 7;
-let timer = null;
+const setStatus = (t) => { $('status').textContent = t; };
 
-// ------------------------------------------------------------ UI
-function buildSliders() {
-  const box = $('sliders');
-  for (const [key, label, min, max, step, def] of PARAMS) {
-    const row = document.createElement('div');
-    row.className = 'row';
-    const lab = document.createElement('label');
-    const name = document.createElement('span'); name.textContent = label;
-    const val = document.createElement('span'); val.id = 'v_' + key; val.textContent = def;
-    lab.append(name, val);
-    const input = document.createElement('input');
-    Object.assign(input, { type: 'range', id: 'p_' + key, min, max, step, value: def });
-    row.append(lab, input);
-    box.appendChild(row);
-    input.addEventListener('input', (e) => {
-      $('v_' + key).textContent = e.target.value;
-      schedule();
+let seed = 7;
+let loaded = false;
+let W = 0, H = 0;              // ขนาดพรีวิว
+let edits = null;              // Int8Array: + เพิ่มตัวคน, - ลบออก
+let editsVer = 0, hasEdits = false;
+let undoStack = [];
+let lastImage = null, lastMask = null;
+let origCanvas = null;
+
+// ------------------------------------------------------------ worker
+const worker = new Worker('worker.js');
+let reqId = 0;
+const waiting = new Map();
+worker.onmessage = (e) => {
+  const { id, ok, result, error, ms } = e.data;
+  const w = waiting.get(id);
+  waiting.delete(id);
+  if (ok) w.res({ ...result, ms }); else w.rej(new Error(error));
+};
+worker.onerror = (e) => setStatus('worker ผิดพลาด: ' + e.message);
+function call(type, payload, transfer = []) {
+  return new Promise((res, rej) => {
+    const id = ++reqId;
+    waiting.set(id, { res, rej });
+    worker.postMessage({ id, type, payload }, transfer);
+  });
+}
+
+// คิวงาน: ถ้ากำลังประมวลผลอยู่ จะเก็บไว้แค่งานล่าสุด (render สำคัญกว่า composite)
+let busy = false, pending = null;
+function want(kind) {
+  if (!loaded) return;
+  pending = pending === 'render' || kind === 'render' ? 'render' : 'composite';
+  pump();
+}
+async function pump() {
+  if (busy || !pending) return;
+  const kind = pending;
+  pending = null;
+  busy = true;
+  setStatus('กำลังประมวลผล...');
+  try {
+    const r = await call(kind, { p: getParams(), seed, edits: hasEdits ? edits : null, editsVer });
+    show(r);
+    setStatus(`เสร็จ (${r.w}×${r.h}, ${r.ms} ms)`);
+  } catch (err) {
+    console.error(err);
+    setStatus('เกิดข้อผิดพลาด: ' + err.message);
+  }
+  busy = false;
+  pump();
+}
+
+let renderTimer = null;
+function scheduleRender(delay = 120) {
+  clearTimeout(renderTimer);
+  renderTimer = setTimeout(() => want('render'), delay);
+}
+
+// ------------------------------------------------------------ แสดงผล
+function setCanvasSize(w, h) {
+  for (const id of ['out', 'maskOverlay', 'strokes']) {
+    const c = $(id);
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  }
+}
+
+function show(r) {
+  lastImage = new ImageData(new Uint8ClampedArray(r.img.buffer), r.w, r.h);
+  lastMask = r.mask;
+  drawMain();
+  drawMaskOverlay();
+}
+
+function drawMain() {
+  const ctx = $('out').getContext('2d');
+  if ($('showOrig').checked && origCanvas) ctx.drawImage(origCanvas, 0, 0);
+  else if (lastImage) ctx.putImageData(lastImage, 0, 0);
+}
+
+function currentMode() {
+  return document.querySelector('input[name=mode]:checked').value;
+}
+
+function drawMaskOverlay() {
+  const c = $('maskOverlay'), ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  const visible = $('showMask').checked || currentMode() !== 'view';
+  if (!visible || !lastMask) return;
+  const img = ctx.createImageData(c.width, c.height), d = img.data;
+  for (let i = 0; i < lastMask.length; i++) {
+    const a = 255 - lastMask[i];
+    if (a > 8) { d[i*4] = 255; d[i*4+1] = 0; d[i*4+2] = 0; d[i*4+3] = a * 0.35; }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+// ------------------------------------------------------------ slider + ปุ่ม −/+
+function makeSlider(box, [key, label, min, max, step, def], onChange) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  const lab = document.createElement('label');
+  const name = document.createElement('span'); name.textContent = label;
+  const val = document.createElement('span'); val.id = 'v_' + key; val.textContent = def;
+  lab.append(name, val);
+
+  const ctl = document.createElement('div');
+  ctl.className = 'ctl';
+  const input = document.createElement('input');
+  Object.assign(input, { type: 'range', id: 'p_' + key, min, max, step, value: def });
+  const dec = document.createElement('button'); dec.textContent = '−'; dec.type = 'button';
+  const inc = document.createElement('button'); inc.textContent = '+'; inc.type = 'button';
+  ctl.append(dec, input, inc);
+  row.append(lab, ctl);
+  box.appendChild(row);
+
+  const decimals = (String(step).split('.')[1] || '').length;
+  const update = () => { val.textContent = Number(input.value).toFixed(decimals); onChange(); };
+  input.addEventListener('input', update);
+
+  const bump = (dir) => {
+    const v = Math.min(max, Math.max(min, parseFloat(input.value) + dir * step));
+    input.value = v.toFixed(decimals);
+    update();
+  };
+  // กดค้างเพื่อเพิ่ม/ลดต่อเนื่อง
+  for (const [btn, dir] of [[dec, -1], [inc, 1]]) {
+    let t1 = null, t2 = null;
+    const stop = () => { clearTimeout(t1); clearInterval(t2); };
+    btn.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      bump(dir);
+      t1 = setTimeout(() => { t2 = setInterval(() => bump(dir), 80); }, 400);
     });
+    for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, stop);
   }
 }
 
@@ -60,453 +176,201 @@ function getParams() {
 }
 
 function resetParams() {
-  for (const [key, , , , , def] of PARAMS) {
+  for (const [key, , , , step, def] of PARAMS) {
     $('p_' + key).value = def;
-    $('v_' + key).textContent = def;
+    $('v_' + key).textContent = Number(def).toFixed((String(step).split('.')[1] || '').length);
   }
   $('bg').value = '#12acf4';
-  schedule();
+  scheduleRender();
 }
 
-function schedule() {
-  if (!state) return;
-  clearTimeout(timer);
-  timer = setTimeout(render, 120);
+// ------------------------------------------------------------ แปรงระบาย
+let stroke = null; // { pts, width, mode }
+
+function toImageXY(e) {
+  const r = $('strokes').getBoundingClientRect();
+  return [(e.clientX - r.left) * (W / r.width), (e.clientY - r.top) * (H / r.height)];
 }
 
-function setStatus(t) { $('status').textContent = t; }
-
-// ------------------------------------------------------------ helpers
-function newF32(w, h, data) {
-  const m = new cv.Mat(h, w, cv.CV_32F);
-  if (data) m.data32F.set(data);
-  return m;
-}
-
-function gaussF(arr, w, h, sigma) {
-  const m = newF32(w, h, arr), d = new cv.Mat();
-  cv.GaussianBlur(m, d, new cv.Size(0, 0), sigma, sigma, cv.BORDER_DEFAULT);
-  const out = d.data32F.slice();
-  m.delete(); d.delete();
-  return out;
-}
-
-function hexToRgb(hex) {
-  const h = hex.replace('#', '');
-  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
-}
-
-function mulberry32(a) {
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function percentileFromHist(hist, total, q) {
-  const target = total * q;
-  let acc = 0;
-  for (let i = 0; i < 256; i++) { acc += hist[i]; if (acc >= target) return i; }
-  return 255;
-}
-
-// ------------------------------------------------------------ 1. ตัดพื้นหลัง
-async function segment(canvas, w, h) {
-  const S = 320;
-  const c = document.createElement('canvas');
-  c.width = c.height = S;
-  const x = c.getContext('2d');
-  x.imageSmoothingQuality = 'high';
-  x.drawImage(canvas, 0, 0, S, S);
-  const d = x.getImageData(0, 0, S, S).data;
-
-  let mx = 1;
-  for (let i = 0; i < d.length; i += 4) mx = Math.max(mx, d[i], d[i + 1], d[i + 2]);
-  const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
-  const t = new Float32Array(3 * S * S);
-  for (let p = 0; p < S * S; p++)
-    for (let ch = 0; ch < 3; ch++)
-      t[ch * S * S + p] = (d[p * 4 + ch] / mx - mean[ch]) / std[ch];
-
-  const res = await session.run({ [session.inputNames[0]]: new ort.Tensor('float32', t, [1, 3, S, S]) });
-  const pred = res[session.outputNames[0]].data;
-  let lo = Infinity, hi = -Infinity;
-  for (const v of pred) { if (v < lo) lo = v; if (v > hi) hi = v; }
-  const norm = new Float32Array(S * S);
-  for (let i = 0; i < norm.length; i++) norm[i] = (pred[i] - lo) / Math.max(hi - lo, 1e-6);
-
-  const small = newF32(S, S, norm), big = new cv.Mat();
-  cv.resize(small, big, new cv.Size(w, h), 0, 0, cv.INTER_LINEAR);
-
-  // ทำความสะอาด mask: opening + blur + threshold (เหมือน rembg post_process)
-  const k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
-  cv.morphologyEx(big, big, cv.MORPH_OPEN, k);
-  cv.GaussianBlur(big, big, new cv.Size(0, 0), 2, 2);
-  const mask = big.data32F.slice();
-  for (let i = 0; i < mask.length; i++) mask[i] = mask[i] > 0.5 ? 1 : 0;
-  small.delete(); big.delete(); k.delete();
-  return mask;
-}
-
-// ข้อมูลสำหรับ refine ที่ไม่ขึ้นกับ slider: ระยะสีจากผนังเดิม, ความมืด, ระยะจากขอบ
-function edgeData(rgb, raw, w, h) {
-  const lab = new cv.Mat();
-  cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab);
-  const L = lab.data, N = w * h;
-  const hist = [new Array(256).fill(0), new Array(256).fill(0), new Array(256).fill(0)];
-  let n = 0;
-  for (let i = 0; i < N; i++)
-    if (raw[i] < 0.05) { hist[0][L[i*3]]++; hist[1][L[i*3+1]]++; hist[2][L[i*3+2]]++; n++; }
-  if (n < 300) { lab.delete(); return null; }
-  const ref = [0, 1, 2].map((c) => percentileFromHist(hist[c], n, 0.5));
-  const wallDist = new Float32Array(N), dark = new Uint8Array(N);
-  for (let i = 0; i < N; i++) {
-    const dl = L[i*3] - ref[0], da = L[i*3+1] - ref[1], db = L[i*3+2] - ref[2];
-    wallDist[i] = Math.sqrt(dl*dl + da*da + db*db);
-    dark[i] = L[i*3] < ref[0] * 0.55 ? 1 : 0;
-  }
-  lab.delete();
-  const inside = new cv.Mat(h, w, cv.CV_8U);
-  for (let i = 0; i < N; i++) inside.data[i] = raw[i] >= 0.5 ? 1 : 0;
-  const dist = new cv.Mat();
-  cv.distanceTransform(inside, dist, cv.DIST_L2, 5);
-  const edgeDist = dist.data32F.slice();
-  inside.delete(); dist.delete();
-  return { wallDist, dark, edgeDist };
-}
-
-// ลบพื้นหลังเดิมที่ติดอยู่ตามช่องผม/ขอบตัว (เช็คเฉพาะแถบขอบ)
-// - ลบเฉพาะส่วน "บาง" ที่สีเหมือนผนัง (ช่องผม, halo)
-// - ส่วนหนา เช่น จมูก ริมฝีปาก ที่สีไม่ใช่ผนังแท้ จะไม่ถูกลบ
-// - จุดที่ไม่ต่อกับพื้นหลังและไม่ติดผม (เช่น ไฮไลต์บนจมูก) จะไม่ถูกลบ
-function refineEdges(raw, ed, w, h, bandPx, protectPx) {
-  const N = w * h;
-  if (!ed || bandPx <= 0) return gaussF(raw, w, h, 1.0);
-  const { wallDist, dark, edgeDist } = ed;
-  const removed = new Float32Array(N);
-  for (let i = 0; i < N; i++) {
-    const key = Math.min(1, Math.max(0, (wallDist[i] - 10) / 18));
-    const near = Math.min(1, Math.max(0, 1 - edgeDist[i] / bandPx));
-    removed[i] = near * (1 - key);
-  }
-  const region = new cv.Mat(h, w, cv.CV_8U);
-  const setRegion = () => { for (let i = 0; i < N; i++) region.data[i] = removed[i] > 0.3 && raw[i] > 0.5 ? 1 : 0; };
-
-  if (protectPx > 0) {
-    setRegion();
-    const k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(2 * protectPx + 1, 2 * protectPx + 1));
-    const thick = new cv.Mat();
-    cv.morphologyEx(region, thick, cv.MORPH_OPEN, k);
-    const k3 = cv.Mat.ones(3, 3, cv.CV_8U);
-    cv.dilate(thick, thick, k3);
-    const tf = gaussF(Float32Array.from(thick.data), w, h, 1.5);
-    for (let i = 0; i < N; i++) {
-      const notWall = Math.min(1, Math.max(0, (wallDist[i] - 8) / 8));
-      removed[i] *= 1 - Math.min(1, tf[i] * 1.5) * notWall;
-    }
-    k.delete(); thick.delete(); k3.delete();
-  }
-
-  // ลบได้เฉพาะกลุ่มที่ต่อกับพื้นหลังจริง หรืออยู่ติดผม/ส่วนมืด
-  setRegion();
-  const labels = new cv.Mat();
-  const nLab = cv.connectedComponents(region, labels, 8, cv.CV_32S);
-  if (nLab > 1) {
-    const seedOut = new cv.Mat(h, w, cv.CV_8U), seedDark = new cv.Mat(h, w, cv.CV_8U);
-    for (let i = 0; i < N; i++) { seedOut.data[i] = raw[i] < 0.5 ? 1 : 0; seedDark.data[i] = dark[i]; }
-    const k5 = cv.Mat.ones(5, 5, cv.CV_8U), k7 = cv.Mat.ones(7, 7, cv.CV_8U);
-    cv.dilate(seedOut, seedOut, k5);
-    cv.dilate(seedDark, seedDark, k7);
-    const ok = new Uint8Array(nLab); ok[0] = 1;
-    const lb = labels.data32S;
-    for (let i = 0; i < N; i++) if (region.data[i] && (seedOut.data[i] || seedDark.data[i])) ok[lb[i]] = 1;
-    const bad = new cv.Mat(h, w, cv.CV_8U);
-    for (let i = 0; i < N; i++) bad.data[i] = ok[lb[i]] ? 0 : 1;
-    const k3 = cv.Mat.ones(3, 3, cv.CV_8U);
-    cv.dilate(bad, bad, k3);
-    const bf = gaussF(Float32Array.from(bad.data), w, h, 1.0);
-    for (let i = 0; i < N; i++) removed[i] *= 1 - Math.min(1, bf[i]);
-    seedOut.delete(); seedDark.delete(); k5.delete(); k7.delete(); bad.delete(); k3.delete();
-  }
-  labels.delete(); region.delete();
-
-  const out = new Float32Array(N);
-  for (let i = 0; i < N; i++) out[i] = raw[i] * (1 - removed[i]);
-  return gaussF(out, w, h, 1.0);
-}
-
-// สร้าง mask สุดท้าย + แถบขอบสำหรับ inpaint (คำนวณใหม่เมื่อ slider ขอบเปลี่ยน)
-function buildMask(st, bandPx, protectPx) {
-  const key = `${bandPx}|${protectPx}`;
-  if (st.maskKey === key) return;
-  const { w, h } = st, N = w * h;
-  const mask = refineEdges(st.raw, st.edge, w, h, bandPx, protectPx);
-
-  const band = new cv.Mat(h, w, cv.CV_8U);
-  const inner = new Uint8Array(N);
-  for (let i = 0; i < N; i++) {
-    band.data[i] = mask[i] > 0.02 && mask[i] <= 0.95 ? 255 : 0;
-    inner[i] = mask[i] > 0.95 ? 1 : 0;
-  }
-  const k5 = cv.Mat.ones(5, 5, cv.CV_8U);
-  cv.dilate(band, band, k5);
-  for (let i = 0; i < N; i++) if (inner[i]) band.data[i] = 0;
-
-  // mask สำหรับรวมภาพ: หดเข้านิด + ขอบนุ่ม
-  const mm = newF32(w, h, mask), me = new cv.Mat();
-  cv.erode(mm, me, k5);
-  cv.GaussianBlur(me, me, new cv.Size(0, 0), 1.0, 1.0);
-  const maskE = me.data32F.slice();
-  mm.delete(); me.delete(); k5.delete();
-
-  if (st.band) st.band.delete();
-  Object.assign(st, { mask, maskE, band, maskKey: key });
-}
-
-// ------------------------------------------------------------ เตรียมข้อมูลตอนอัปโหลด
-async function prepare(file) {
-  if (!file.type.startsWith('image/')) throw new Error('ไฟล์นี้ไม่ใช่รูปภาพ');
-  if (file.size > MAX_FILE_MB * 1024 * 1024) throw new Error(`ไฟล์ใหญ่เกิน ${MAX_FILE_MB} MB`);
-  const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
-  if (bmp.width * bmp.height > MAX_PIXELS) { bmp.close(); throw new Error('ภาพความละเอียดสูงเกินไป'); }
-  const s = Math.min(1, MAX_SIZE / Math.max(bmp.width, bmp.height));
-  const w = Math.round(bmp.width * s), h = Math.round(bmp.height * s);
-  const c = document.createElement('canvas');
-  c.width = w; c.height = h;
-  const ctx = c.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(bmp, 0, 0, w, h);
-  bmp.close();
-  const rgba = ctx.getImageData(0, 0, w, h);
-
-  const srcRGBA = cv.matFromImageData(rgba);
-  const rgb = new cv.Mat();
-  cv.cvtColor(srcRGBA, rgb, cv.COLOR_RGBA2RGB);
-  srcRGBA.delete();
-
-  setStatus('กำลังตัดพื้นหลัง...');
-  await new Promise((r) => setTimeout(r, 20));
-  const raw = await segment(c, w, h);
-  const edge = edgeData(rgb, raw, w, h);
-
-  // ค่าที่ไม่ขึ้นกับ slider: blur ของภาพสี และ high-pass ของ gray ต้นฉบับ
-  const rgbF = new cv.Mat(); rgb.convertTo(rgbF, cv.CV_32FC3);
-  const rgbBlur = new cv.Mat();
-  cv.GaussianBlur(rgbF, rgbBlur, new cv.Size(0, 0), 1.5, 1.5);
-  const g0m = new cv.Mat(); cv.cvtColor(rgb, g0m, cv.COLOR_RGB2GRAY);
-  const g0 = Float32Array.from(g0m.data);
-  const g0b = gaussF(g0, w, h, 2.5);
-  const hp = new Float32Array(w * h);
-  for (let i = 0; i < w * h; i++) hp[i] = g0[i] - g0b[i];
-
-  // b1/b2 bilateral ของภาพสีไม่ขึ้นกับ slider เช่นกัน
-  const b1 = new cv.Mat(), b2 = new cv.Mat();
-  cv.bilateralFilter(rgb, b1, 9, 45, 9);
-  cv.bilateralFilter(b1, b2, 7, 30, 7);
-
-  const st = {
-    w, h, rgba, rgb, raw, edge, hp, band: null, maskKey: null,
-    rgbF: rgbF.data32F.slice(), rgbBlur: rgbBlur.data32F.slice(), smooth: b2.data.slice(),
-    bgCache: null,
-  };
-  rgbF.delete(); rgbBlur.delete(); g0m.delete(); b1.delete(); b2.delete();
-  return st;
-}
-
-// ------------------------------------------------------------ พื้นหลัง
-function makeBackground(w, h, hex, shards, sd) {
-  const c = document.createElement('canvas');
-  c.width = w; c.height = h;
-  const ctx = c.getContext('2d', { willReadFrequently: true });
-  ctx.fillStyle = hex;
-  ctx.fillRect(0, 0, w, h);
-  // vignette อ่อน ๆ
-  const img = ctx.getImageData(0, 0, w, h), d = img.data;
-  for (let y = 0; y < h; y++) {
-    const dy = (y - h * 0.4) / h;
-    for (let x = 0; x < w; x++) {
-      const dx = (x - w / 2) / w;
-      const f = 1.06 - 0.18 * Math.sqrt(dx * dx + dy * dy);
-      const i = (y * w + x) * 4;
-      d[i] = Math.min(255, d[i] * f); d[i+1] = Math.min(255, d[i+1] * f); d[i+2] = Math.min(255, d[i+2] * f);
-    }
-  }
-  ctx.putImageData(img, 0, 0);
-  // เศษกระจก
-  const rng = mulberry32(sd);
-  const s = Math.min(w, h);
-  ctx.filter = 'blur(0.7px)';
-  for (let k = 0; k < shards; k++) {
-    const cx = rng() * w, cy = rng() * h;
-    const r = (0.008 + rng() * 0.027) * s;
-    const n = 3 + Math.floor(rng() * 3);
-    const ang = Array.from({ length: n }, () => rng() * Math.PI * 2).sort((a, b) => a - b);
-    const tg = 230 + rng() * 25, tb = 140 + rng() * 70, a = 0.25 + rng() * 0.35;
-    ctx.fillStyle = `rgba(${tb | 0},${tg | 0},255,${a.toFixed(2)})`;
+function drawStroke(ctx, s, color) {
+  ctx.strokeStyle = ctx.fillStyle = color;
+  ctx.lineWidth = s.width;
+  ctx.lineCap = ctx.lineJoin = 'round';
+  if (s.pts.length === 1) {
     ctx.beginPath();
-    ang.forEach((t, j) => {
-      const rr = r * (0.5 + rng() * 0.8);
-      const px = cx + rr * Math.cos(t), py = cy + rr * Math.sin(t);
-      j ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
-    });
-    ctx.closePath();
+    ctx.arc(s.pts[0][0], s.pts[0][1], s.width / 2, 0, Math.PI * 2);
     ctx.fill();
-  }
-  ctx.filter = 'none';
-  return ctx.getImageData(0, 0, w, h).data;
-}
-
-// ------------------------------------------------------------ ฟิลเตอร์หลัก
-function render() {
-  const t0 = performance.now();
-  const p = getParams();
-  const { w, h } = state;
-  const N = w * h;
-  buildMask(state, p.band, p.protect);
-
-  if ($('showOrig').checked) {
-    const out = $('out'); out.width = w; out.height = h;
-    out.getContext('2d').putImageData(state.rgba, 0, 0);
     return;
   }
-
-  // 2. ลบริ้วรอยบางส่วน + คืน texture ผิว
-  const s = p.smooth;
-  const soft = new cv.Mat(h, w, cv.CV_8UC3);
-  const SD = soft.data, F = state.rgbF, B = state.rgbBlur, SM = state.smooth;
-  for (let i = 0; i < N * 3; i++) {
-    const v = F[i] * (1 - s) + SM[i] * s + (F[i] - B[i]) * 0.35 * (1 - s);
-    SD[i] = v < 0 ? 0 : v > 255 ? 255 : v;
-  }
-  const gray = new cv.Mat();
-  cv.cvtColor(soft, gray, cv.COLOR_RGB2GRAY);
-  soft.delete();
-  cv.inpaint(gray, gray, state.band, 5, cv.INPAINT_TELEA);
-
-  // 3. โทนแสงเงา
-  const clahe = new cv.CLAHE(1.6, new cv.Size(8, 8));
-  const cl = new cv.Mat();
-  clahe.apply(gray, cl);
-  clahe.delete();
-  const hist = new Array(256).fill(0);
-  let n = 0;
-  for (let i = 0; i < N; i++) if (state.mask[i] > 0.5) { hist[cl.data[i]]++; n++; }
-  let lo = 0, hi = 255;
-  if (n > 100) { lo = percentileFromHist(hist, n, 0.02); hi = percentileFromHist(hist, n, 0.98); }
-  const g = new Float32Array(N);
-  const g8 = new cv.Mat(h, w, cv.CV_8U);
-  for (let i = 0; i < N; i++) {
-    let v = (cl.data[i] - lo) / Math.max(hi - lo, 1);
-    v = Math.pow(v < 0 ? 0 : v > 1 ? 1 : v, p.gamma);
-    g[i] = v;
-    g8.data[i] = Math.round(v * 255);
-  }
-  cl.delete();
-  const gsm = new cv.Mat();
-  cv.bilateralFilter(g8, gsm, 9, 30, 9);
-  g8.delete();
-  const gs = gaussF(Float32Array.from(gsm.data), w, h, 1.2);
-  gsm.delete();
-
-  const steps = p.levels - 1;
-  const tone = new Float32Array(N);
-  for (let i = 0; i < N; i++) {
-    const x = (gs[i] / 255) * steps;
-    const base = Math.floor(x);
-    let t = Math.min(1, Math.max(0, (x - base - 0.35) / 0.3));
-    t = t * t * (3 - 2 * t);
-    const q = (base + t) / steps;
-    const o = q * p.posterize + g[i] * (1 - p.posterize);
-    tone[i] = p.black + o * (p.white - p.black);
-  }
-
-  // 4. เส้นขอบบาง ๆ
-  if (p.ink > 0) {
-    const md = new cv.Mat(), th = new cv.Mat();
-    cv.medianBlur(gray, md, 5);
-    cv.adaptiveThreshold(md, th, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY, 11, 9);
-    const e = gaussF(Float32Array.from(th.data), w, h, 0.8);
-    for (let i = 0; i < N; i++) tone[i] *= 1 - (1 - e[i] / 255) * p.ink;
-    md.delete(); th.delete();
-  }
-  gray.delete();
-
-  // 5. รายละเอียดผม/ผ้า
-  const lo2 = p.black * 0.6;
-  for (let i = 0; i < N; i++) {
-    const v = tone[i] + state.hp[i] * p.detail;
-    tone[i] = v < lo2 ? lo2 : v > p.white ? p.white : v;
-  }
-
-  // 6. พื้นหลัง (cache ไว้ถ้าค่าไม่เปลี่ยน)
-  const bgKey = `${p.bg}|${p.shards}|${seed}`;
-  if (!state.bgCache || state.bgCache.key !== bgKey)
-    state.bgCache = { key: bgKey, data: makeBackground(w, h, p.bg, p.shards, seed) };
-  const bg = state.bgCache.data;
-
-  // 7. ใส่สีฟ้าในเงา แล้วรวมภาพ
-  const blue = hexToRgb(p.bg);
-  const out = new ImageData(w, h);
-  const O = out.data, M = state.maskE;
-  for (let i = 0; i < N; i++) {
-    const tv = tone[i], sw = 1 - tv / 255, m = M[i];
-    for (let c = 0; c < 3; c++) {
-      const pv = tv * (1 - p.tint * sw) + blue[c] * 0.35 * p.tint * sw;
-      O[i * 4 + c] = pv * m + bg[i * 4 + c] * (1 - m);
-    }
-    O[i * 4 + 3] = 255;
-  }
-  const cvs = $('out');
-  cvs.width = w; cvs.height = h;
-  cvs.getContext('2d').putImageData(out, 0, 0);
-  setStatus(`เสร็จ (${w}×${h}, ${Math.round(performance.now() - t0)} ms)`);
+  ctx.beginPath();
+  ctx.moveTo(s.pts[0][0], s.pts[0][1]);
+  for (const [x, y] of s.pts.slice(1)) ctx.lineTo(x, y);
+  ctx.stroke();
 }
 
-// ------------------------------------------------------------ เริ่มต้น
-async function loadCV() {
-  let c = window.cv;
-  if (c instanceof Promise) c = await c;
-  if (!c.Mat) await new Promise((r) => { c.onRuntimeInitialized = r; });
-  return c;
+function redrawStroke() {
+  const c = $('strokes'), ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (stroke) drawStroke(ctx, stroke, stroke.mode === 'add' ? 'rgba(0,200,60,0.5)' : 'rgba(255,40,40,0.5)');
 }
 
-async function init() {
-  buildSliders();
-  $('reset').onclick = resetParams;
-  $('reseed').onclick = () => { seed = (Math.random() * 1e9) | 0; schedule(); };
-  $('bg').addEventListener('input', schedule);
-  $('showOrig').addEventListener('change', schedule);
-  $('download').onclick = () => {
-    $('out').toBlob((b) => {
+function commitStroke() {
+  // วาดเส้นลง canvas ชั่วคราว แล้วแปลงเป็นค่า edits
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  drawStroke(ctx, stroke, '#fff');
+  const a = ctx.getImageData(0, 0, W, H).data;
+  const target = stroke.mode === 'add' ? 127 : -127;
+  for (let i = 0; i < W * H; i++) {
+    const k = a[i * 4 + 3] / 255;
+    if (k > 0) edits[i] = Math.round(edits[i] * (1 - k) + target * k);
+  }
+  stroke = null;
+  redrawStroke();
+  editsChanged();
+}
+
+function pushUndo() {
+  undoStack.push(edits.slice());
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+}
+
+function editsChanged() {
+  editsVer++;
+  hasEdits = edits.some((v) => v !== 0);
+  $('undo').disabled = undoStack.length === 0;
+  $('clearEdits').disabled = !hasEdits;
+  want('composite');      // แสดงผลเร็วทันที
+  scheduleRender(700);    // แล้วค่อยคำนวณโทนใหม่ทั้งหมดเมื่อหยุดระบาย
+}
+
+function setupBrush() {
+  const c = $('strokes');
+  c.addEventListener('pointerdown', (e) => {
+    const mode = currentMode();
+    if (mode === 'view' || !loaded) return;
+    e.preventDefault();
+    c.setPointerCapture(e.pointerId);
+    pushUndo();
+    stroke = { pts: [toImageXY(e)], width: parseFloat($('p_brush').value), mode };
+    redrawStroke();
+  });
+  c.addEventListener('pointermove', (e) => {
+    if (!stroke) return;
+    stroke.pts.push(toImageXY(e));
+    redrawStroke();
+  });
+  const end = () => { if (stroke) commitStroke(); };
+  c.addEventListener('pointerup', end);
+  c.addEventListener('pointercancel', end);
+
+  for (const r of document.querySelectorAll('input[name=mode]')) {
+    r.addEventListener('change', () => {
+      c.classList.toggle('painting', currentMode() !== 'view');
+      drawMaskOverlay();
+    });
+  }
+  $('undo').onclick = () => {
+    if (!undoStack.length) return;
+    edits = undoStack.pop();
+    editsChanged();
+  };
+  $('clearEdits').onclick = () => {
+    pushUndo();
+    edits.fill(0);
+    editsChanged();
+  };
+}
+
+// ------------------------------------------------------------ อัปโหลด / ดาวน์โหลด
+async function onFile(f) {
+  if (!f.type.startsWith('image/')) throw new Error('ไฟล์นี้ไม่ใช่รูปภาพ');
+  if (f.size > MAX_FILE_MB * 1024 * 1024) throw new Error(`ไฟล์ใหญ่เกิน ${MAX_FILE_MB} MB`);
+  const bmp = await createImageBitmap(f, { imageOrientation: 'from-image' });
+  if (bmp.width * bmp.height > MAX_PIXELS) { bmp.close(); throw new Error('ภาพความละเอียดสูงเกินไป'); }
+
+  loaded = false;
+  $('download').disabled = true;
+  setStatus('กำลังตัดพื้นหลัง...');
+
+  // ภาพสำหรับ worker (ย่อเหลือ EXPORT_MAX)
+  const s = Math.min(1, EXPORT_MAX / Math.max(bmp.width, bmp.height));
+  const rc = document.createElement('canvas');
+  rc.width = Math.round(bmp.width * s); rc.height = Math.round(bmp.height * s);
+  const rctx = rc.getContext('2d');
+  rctx.imageSmoothingQuality = 'high';
+  rctx.drawImage(bmp, 0, 0, rc.width, rc.height);
+  bmp.close();
+  const big = await createImageBitmap(rc);
+
+  // ภาพต้นฉบับขนาดพรีวิว (ไว้ดูเทียบ)
+  const ps = Math.min(1, PREVIEW_MAX / Math.max(big.width, big.height));
+  origCanvas = document.createElement('canvas');
+  origCanvas.width = Math.round(big.width * ps);
+  origCanvas.height = Math.round(big.height * ps);
+  origCanvas.getContext('2d').drawImage(big, 0, 0, origCanvas.width, origCanvas.height);
+
+  const r = await call('load', { bitmap: big, previewMax: PREVIEW_MAX }, [big]);
+  W = r.w; H = r.h;
+  setCanvasSize(W, H);
+  edits = new Int8Array(W * H);
+  editsVer = 0; hasEdits = false; undoStack = [];
+  $('undo').disabled = true; $('clearEdits').disabled = true;
+  loaded = true;
+  want('render');
+  $('download').disabled = false;
+}
+
+async function download() {
+  $('download').disabled = true;
+  setStatus('กำลังสร้างภาพความละเอียดเต็ม...');
+  try {
+    const r = await call('export', { p: getParams(), seed, edits: hasEdits ? edits : null, exportMax: EXPORT_MAX });
+    const c = document.createElement('canvas');
+    c.width = r.w; c.height = r.h;
+    c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(r.img.buffer), r.w, r.h), 0, 0);
+    c.toBlob((b) => {
       const a = document.createElement('a');
       a.href = URL.createObjectURL(b);
       a.download = 'p3r_filter.png';
       a.click();
       setTimeout(() => URL.revokeObjectURL(a.href), 5000);
     }, 'image/png');
-  };
+    setStatus(`ดาวน์โหลดแล้ว (${r.w}×${r.h}, ${r.ms} ms)`);
+  } catch (err) {
+    console.error(err);
+    setStatus('ดาวน์โหลดไม่สำเร็จ: ' + err.message);
+  }
+  $('download').disabled = false;
+}
+
+// ------------------------------------------------------------ เริ่มต้น
+async function init() {
+  for (const p of PARAMS) makeSlider($('sliders'), p, () => scheduleRender());
+  makeSlider($('brushSliders'), BRUSH_PARAMS[0], () => {});
+  makeSlider($('brushSliders'), BRUSH_PARAMS[1], () => {
+    $('stage').style.width = $('p_zoom').value + '%';
+  });
+  setupBrush();
+
+  $('reset').onclick = resetParams;
+  $('reseed').onclick = () => { seed = (Math.random() * 1e9) | 0; want('composite'); };
+  $('bg').addEventListener('input', () => scheduleRender());
+  $('showOrig').addEventListener('change', drawMain);
+  $('showMask').addEventListener('change', drawMaskOverlay);
+  $('download').onclick = download;
   $('file').addEventListener('change', async (e) => {
     const f = e.target.files[0];
     if (!f) return;
-    try {
-      setStatus('กำลังเตรียมภาพ...');
-      if (state) { state.rgb.delete(); if (state.band) state.band.delete(); state = null; }
-      $('download').disabled = true;
-      state = await prepare(f);
-      render();
-      $('download').disabled = false;
-    } catch (err) {
+    try { await onFile(f); } catch (err) {
       console.error(err);
       setStatus('เกิดข้อผิดพลาด: ' + err.message);
     }
   });
 
   try {
-    cv = await loadCV();
-    ort.env.wasm.wasmPaths = ORT_WASM;
-    ort.env.wasm.numThreads = 1;
-    session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ['wasm'] });
+    await call('init');
     $('file').disabled = false;
     setStatus('พร้อมแล้ว เลือกรูปเพื่อเริ่ม');
   } catch (err) {
